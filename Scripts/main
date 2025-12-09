@@ -5,12 +5,13 @@ function planSchedule() {
   //Conseguimos las cosas basicas para saber cuando operamos
   const now = getNow_(); // Momento (con offset)
   const horizon = new Date(now.getTime() + HORIZON_DAYS * 24 * 60 * 60 * 1000); // Final del periodo de planning
+  const espaciosLibre = buildFreeSlots_(now,horizon);
   const eventTotal = [...getPendingTasks_(now),...buildExamPriorityArray_()]; // Los eventos que vamos a colocar
   
   if (eventTotal.length > 0) {
     // Ordenamos las tareas en funcion del orden de prioridades de dentro de la función
     const eventosOrdenados = sortEventsByUrgency_(eventTotal);
-    const espaciosLibre = buildFreeSlots_(now,horizon);
+
     if (!espaciosLibre){
       Logger.log("No hay espacios libres"); 
       return} 
@@ -21,7 +22,7 @@ function planSchedule() {
 
 //REVISADO
 function clearAllEvents(){
-    const now = getNow_(); // Momento (con offset)
+    const now = getNow_(-1); // Momento (con offset)
     const horizon = new Date(now.getTime() + HORIZON_DAYS * 24 * 60 * 60 * 1000);
     clearAutomaticEvents_(fetchCalendar_(TASK_CALENDAR_NAME), now, horizon);
     clearAutomaticEvents_(fetchCalendar_(STUDY_CALENDAR_NAME), now, horizon);
