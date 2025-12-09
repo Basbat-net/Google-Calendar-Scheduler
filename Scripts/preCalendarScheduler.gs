@@ -178,6 +178,13 @@ function getPendingTasks_(now) {
     const row = values[i];
     const concepto = row[COL_CONCEPTO - 1];
     let deadline = row[COL_DEADLINE - 1];
+    // ajustamos la deadline para que sea el dia de antes a las 23:59    
+    if (deadline instanceof Date && !isNaN(deadline)) {
+      const effDeadline = new Date(deadline.getTime());
+      effDeadline.setDate(effDeadline.getDate() - 1);
+      effDeadline.setHours(23, 59, 0, 0);
+      deadline = effDeadline;
+    }
     let prio = Number(row[COL_PRIO - 1]) || 0;
     const etaHours = Number(row[COL_ETA - 1]) || 0;
     let progreso = row[COL_PROGRESO - 1]/100;
@@ -654,6 +661,11 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
   
   // Recalcular stats tras meter el extra
   stats = computeOverflowStats_(dayUsedBlocks);
+
+
+  // FASE DE EMPEQUEÑECIMIENTO DE DIAS LLENOS
+  // Una vez que hemos encontrado la distribución optima, algunos dias puede que necesiten más horas que las que hay disponibles, asi que toca filtrar
+  // La prioridad será siempre Tasks 5 > Estudio 5 >  Resto de osas
 
 
   // Resultados finales
