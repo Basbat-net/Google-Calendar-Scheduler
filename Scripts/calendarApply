@@ -57,7 +57,7 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
     Logger.log("No se ha podido construir un precalendario; saliendo.");
     return;
   }
-  const {eventDayBlocks, eventsMeta} = towerResult;
+  const {eventDayBlocks, eventsMeta, extraTimes} = towerResult;
 
   // copiamos freeSlots para ir recortandolo
   const workingSlots = freeSlots.map(slot => ({
@@ -79,9 +79,11 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
 
   // IMPORTANTE: Iteramos los eventos y en funcion de los freeSlots los colocamos, no miramos los slots para ver qué metemos
   eventsMetaOrdered.forEach(meta => {
+    
     // Datos del evento
     const ev = meta.originalEvent;
     const id = meta.id;
+    if (id == "E#0") Logger.log("lo puedo probar");
     const type = meta.type;
     const deadline = meta.deadline;
     const isTask = (type === "Tareas");
@@ -110,9 +112,10 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
 
       // las tareas y el estudio se hacen de maneras diferentes, asi que hay que tratarlos con diferente logica
       if (type === "Tareas") {
+        if (id == "E#0") Logger.log("está entrando en tareas");
         // usamos los slots de ese día ordenados por cercanía a la comida
         const slotIndices = getSlotsIndicesOrderedByLunchProximity_(dayKey, workingSlots);
-
+        if (id == "E#0") Logger.log("slot indices: " + slotIndices);
         for (let idx = 0; idx < slotIndices.length && blocksForDay > 0; idx++) {
           // Datos del slot
           const i = slotIndices[idx];
@@ -125,7 +128,7 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
           const slotDayKey = dateKeyFromDate_(slotStart);
           if (slotDayKey !== dayKey) continue;
 
-
+          if (id == "E#0") Logger.log("blocksForDay:" + blocksForDay);
           while (blocksForDay > 0) {
             if (slotEnd <= slotStart) break;
             const isMorning = slotEnd <= lunchMid; // si es por la mañana se trata diferente
@@ -135,17 +138,24 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
             const blocksPerChunk = isShortTask ? 1 : 2;
             const chunkMillis = blocksPerChunk * (30 * 60 * 1000);
 
+            if (id == "E#0") Logger.log("huuuuh");
             // Para la mañana, empieza a rellenar desde lo mas cerca a la comida
             if (isMorning) {
+              if (id == "E#0") Logger.log("entra en mañana");
               //Datos del evento
               const availableMinutes = (slotEnd.getTime() - slotStart.getTime()) / (60 * 1000);
+              if (id == "E#0") Logger.log("Pasa 1");
               if (availableMinutes < minChunkMinutes) break;
               const eventEnd = new Date(slotEnd.getTime());
               const eventStart = new Date(eventEnd.getTime() - chunkMillis);
               if (eventEnd <= now) break;
+              if (id == "E#0") Logger.log("Pasa 2");
               if (eventStart < slotStart) break;
+              if (id == "E#0") Logger.log("Pasa 3");
+              if (id == "E#0") Logger.log(eventEnd);
+              if (id == "E#0") Logger.log(deadline);              
               if (eventEnd > deadline)    break;
-              
+              if (id == "E#0") Logger.log("Pasa 4");
               // Colocamos una sección del evento en este segmento en especifico
               segments.push({ start: new Date(eventStart), end: new Date(eventEnd) });
 
@@ -155,8 +165,10 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
               blocksForDay -= blocksPerChunk;
 
             } 
+
             // para la tarde, lo rellenamos en descendente desde la hora de la comida
             else {
+              if (id == "E#0") Logger.log("entra en tarde");
               // Datos del evento
               const effectiveStart = new Date(Math.max(slotStart.getTime(), now.getTime()));
               const availableMinutes = (slotEnd.getTime() - effectiveStart.getTime()) / (60 * 1000);
@@ -182,6 +194,7 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
       const slotIndices = getSlotsIndicesOrderedByLunchProximity_(dayKey, workingSlots); // Los slots, no los eventos
 
       for (let idx = 0; idx < slotIndices.length && blocksForDay >= 2; idx++) {
+        if (id == "E#0") Logger.log("alocacion de la tarea como tal");
         // Datos del slot
         const i = slotIndices[idx];
         const slot = workingSlots[i];
@@ -277,11 +290,16 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
     }
 
     if (segments.length > 0) {
+
+
       // Aquí es realmente donde se meten los segmentos dentro del segementsByKey que es la que luego pasará al calendar
       const key = type + '||' + title;
       if (!segmentsByKey[key])  segmentsByKey[key] = { cal: targetCal, title: title, segments: [] };
       segmentsByKey[key].segments.push(...segments);
-    } else Logger.log("No se han podido crear segmentos reales en el calendario para '" + (meta.concepto || id) +  "' pese a tener bloques en el precalendario.");
+    } 
+    else {
+      Logger.log("No se han podido crear segmentos reales en el calendario para '" + (meta.concepto || id) +  "' pese a tener bloques en el precalendario.");        
+      Logger.log(segments.length);}
     
   });
 
@@ -387,6 +405,179 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
 
     });
   }
+
+  // FASE EXTRA: PLANIFICACIÓN DEL TIEMPO EXTRA AL FINAL DEL DÍA
+  // Estas horas solo existen en días con overflow > 0, así que por definición
+  // tienen que ir más allá de los límites normales de ese día.
+  // En vez de encajarlas a la fuerza en el mismo día del overflow,
+  // intentamos recolocarlas en cualquier día (hasta el deadline del evento)
+  // donde se puedan FUSIONAR con un evento consecutivo del mismo tipo,
+  // para evitar cortes raros entre asignaturas.
+
+  if (extraTimes && Object.keys(extraTimes).length > 0) {
+    const metaById = {};
+    eventsMeta.forEach(m => { metaById[m.id] = m; });
+
+    // Fin de jornada usable para un dayKey dado (usa los intervalos globales)
+    function getEndOfUsableDayForKey_(dayKey) {
+      const d = dateFromKey_(dayKey);   // 2025-12-09 → Date local ese día
+      const dow = d.getDay();           // 0 = domingo, 6 = sábado
+
+      const intervals = (dow === 0 || dow === 6)
+        ? INTERVALOS_USABLES_FINDES
+        : INTERVALOS_USABLES_ENTRE_SEMANA;
+
+      // Si por lo que sea no hay intervalos, tomamos 23:59 como "final de día".
+      if (!intervals || intervals.length === 0) {
+        return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 0, 0);
+      }
+
+      const last = intervals[intervals.length - 1];
+      return new Date(
+        d.getFullYear(),
+        d.getMonth(),
+        d.getDate(),
+        last.endHour,
+        last.endMinute,
+        0,
+        0
+      );
+    }
+
+    // Último segmento (y su key) ya colocado en ese día, si existe
+    function getLastSegmentInfoForDay_(dayKey) {
+      let lastSeg = null;
+      let lastKey = null;
+
+      Object.keys(segmentsByKey).forEach(k => {
+        const entry = segmentsByKey[k];
+        if (!entry || !entry.segments) return;
+        entry.segments.forEach(seg => {
+          if (!seg.start || !seg.end) return;
+          if (dateKeyFromDate_(seg.start) !== dayKey) return;
+          if (!lastSeg || seg.end.getTime() > lastSeg.end.getTime()) {
+            lastSeg = seg;
+            lastKey = k;
+          }
+        });
+      });
+
+      if (!lastSeg) return null;
+      return {
+        key: lastKey,
+        end: new Date(lastSeg.end.getTime())
+      };
+    }
+
+    // Elige el mejor día para colocar UN bloque extra de este evento:
+    //  - Preferimos días donde el último segmento del día sea del mismo key (fusión perfecta).
+    //  - Después, días que al menos tengan algún evento.
+    //  - Si no hay nada, usamos un día de fallback (por ejemplo, uno de los días originales en extraTimes).
+    function pickBestDayForExtraBlock_(keyExtra, metaExtra, fallbackDays) {
+      const allowedDays = (metaExtra.allowedDays || []).slice();
+      const deadline = metaExtra.deadline;
+      const deadlineKey = deadline ? dateKeyFromDate_(deadline) : null;
+
+      // Conjunto de candidatos: allowedDays ∩ (≤ deadline) ∪ fallbackDays
+      const candidateSet = {};
+      allowedDays.forEach(dk => {
+        if (deadlineKey && dk > deadlineKey) return;
+        candidateSet[dk] = true;
+      });
+      (fallbackDays || []).forEach(dk => {
+        if (dk === "concepto") return;
+        candidateSet[dk] = true;
+      });
+
+      const candidates = Object.keys(candidateSet).sort();
+      if (candidates.length === 0) return null;
+
+      let bestDay = null;
+      let bestScore = -1;
+
+      candidates.forEach(dk => {
+        const info = getLastSegmentInfoForDay_(dk);
+        let score = 0;
+        if (info) {
+          // 2 → el último evento del día ya es de este mismo key (fusión perfecta).
+          // 1 → el día tiene eventos, pero de otra cosa.
+          score = (info.key === keyExtra) ? 2 : 1;
+        } else {
+          // 0 → día vacío; solo lo usamos si no hay nada mejor.
+          score = 0;
+        }
+
+        if (
+          bestDay === null ||
+          score > bestScore ||
+          (score === bestScore && dk < bestDay) // desempate por día más cercano (alfabético YYYY-MM-DD)
+        ) {
+          bestDay = dk;
+          bestScore = score;
+        }
+      });
+
+      if (!bestDay) return null;
+
+      const lastInfo = getLastSegmentInfoForDay_(bestDay);
+      const baseStart = lastInfo
+        ? new Date(lastInfo.end.getTime())
+        : getEndOfUsableDayForKey_(bestDay);
+
+      return { dayKey: bestDay, baseStart: baseStart };
+    }
+
+    Object.keys(extraTimes).forEach(evId => {
+      const metaExtra = metaById[evId];
+      if (!metaExtra) return;
+
+      const titleExtra = metaExtra.concepto || ("Tarea " + (metaExtra.rowIndex != null ? metaExtra.rowIndex : ""));
+      const typeExtra  = metaExtra.type;
+      const calExtra   = calendarByType[typeExtra] || fetchCalendar_(typeExtra);
+      if (!calExtra) return;
+
+      const dayMap = extraTimes[evId];
+
+      const keyExtra = typeExtra + "||" + titleExtra;
+      if (!segmentsByKey[keyExtra]) {
+        segmentsByKey[keyExtra] = { cal: calExtra, title: titleExtra, segments: [] };
+      }
+
+      // Total de bloques extra para este evento (sumando todos los días origen)
+      let totalBlocksExtra = 0;
+      const fallbackDays = [];
+      Object.keys(dayMap).forEach(dayKey => {
+        if (dayKey === "concepto") return;
+        const blocks = dayMap[dayKey] || 0;
+        if (blocks > 0) {
+          totalBlocksExtra += blocks;
+          fallbackDays.push(dayKey);
+        }
+      });
+      if (totalBlocksExtra <= 0) return;
+
+      // Vamos colocando cada bloque individualmente, eligiendo el mejor día cada vez
+      for (let b = 0; b < totalBlocksExtra; b++) {
+        const choice = pickBestDayForExtraBlock_(keyExtra, metaExtra, fallbackDays);
+        if (!choice) break;
+
+        const baseStart = choice.baseStart;
+
+        // bloque de 30'
+        const segStart = new Date(baseStart.getTime());
+        const segEnd   = new Date(segStart.getTime() + 30 * 60 * 1000);
+
+        segmentsByKey[keyExtra].segments.push({
+          start: segStart,
+          end:   segEnd
+        });
+
+        // Actualizamos internamente para que el siguiente bloque vea el nuevo "final de día"
+        // (getLastSegmentInfoForDay_ leerá ya este nuevo segmento).
+      }
+    });
+  }
+
 
 
   // REORDENADO Y AGRUPACIÓN DE EVENTOS DE ESTUDIO
@@ -594,3 +785,4 @@ function scheduleTasksIntoFreeSlots_(freeSlots, eventsByBracket) {
     return false;
     }
 }
+
