@@ -116,7 +116,7 @@ function buildFreeSlots_(start, end){
       }
     });
   }
-  Logger.log(mergedFreeSlots);
+  Logger.log(JSON.stringify(mergedFreeSlots, null, 2));
   return mergedFreeSlots;
 }
 
@@ -371,6 +371,9 @@ function buildExamPriorityArray_() {
 // Nota: Aun queda por programar la parte que, para días con muchos eventos, purgue el día para que fisicamente quepan
 function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
   
+
+  Logger.log("lo que entra a las torres");
+  Logger.log(JSON.stringify(eventsByBracket, null, 2));
   // 1- PREPARACIÓN DE DATOS INICIALES
   // Extracción de los minutos por día
   const freeMinutesByDay = {};
@@ -395,6 +398,7 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
   const eventsMeta = [];
   const eventMetaById = {};
   let eventCounter = 0;
+  
   eventsByBracket.forEach(ev => {
     const id = "E#" + (eventCounter++);
     const meta = { ...ev, id };
@@ -414,13 +418,15 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
     let remainingBlocks = blocksTotal;
     if (remainingBlocks <= 0) return;
 
-    eventDayBlocks[id] = eventDayBlocks[id] || {}; // Lo inicializa si está vacío
+    eventDayBlocks[id] = eventDayBlocks[id] || {concepto:meta["type"] + ": " + meta["concepto"]}; // Lo inicializa si está vacío
 
     // Mira en que dias puede poner los eventos, pero solo incluye los dias dentro del intervalo actual de freeSlots
     const allowedDesc = [...allowedDays]
       // Probamos con la lista de minutos libres por dia, y la usamos de referencia para que si un dia no está en ese rango, no la cuente,
       // que si no jode el algoritmo
-      .filter(k => Object.prototype.hasOwnProperty.call(freeMinutesByDay, k)) 
+      .filter(k => Object.prototype.hasOwnProperty.call(freeMinutesByDay, k))
+      // Además, el día tiene que tener hueco útil antes de la hora de deadline de ese evento
+      .filter(k => isDayUsableForEvent_(meta, k))
       .sort((a, b) =>
         dateFromKey_(b).getTime() - dateFromKey_(a).getTime()
       );
@@ -484,7 +490,6 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
   let improvedGlobal = false;
   const MAX_GLOBAL_ITER = 5000;
   const MAX_PAIR_STEPS = 100;
-
   for (let iter = 0; iter < MAX_GLOBAL_ITER; iter++) {
     stats = computeOverflowStats_(dayUsedBlocks);
     const overflow = stats.overflow;
@@ -554,6 +559,9 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
             const allowed = meta.allowedDays;
             if (allowed.indexOf(sourceDay) === -1 || allowed.indexOf(targetDay) === -1) continue; // si el evento no se puede en ninguno lo saltamos
 
+            // El movimiento solo tiene sentido si el día es físicamente usable para ese evento (por hora de deadline)
+            if (!isDayUsableForEvent_(meta, sourceDay) || !isDayUsableForEvent_(meta, targetDay)) continue;
+            
             // Datos para probar el movimiento
             const type = meta.type;
             const blocksOnSource = eventDayBlocks[evId][sourceDay] || 0;
@@ -663,11 +671,222 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
   stats = computeOverflowStats_(dayUsedBlocks);
 
 
+  const resultPre = {
+    freeMinutesByDay: freeMinutesByDay,
+    finalDayUsedMinutes: Object.fromEntries(
+      dayKeys.map(k => [k, (dayUsedBlocks[k] || 0) * 30])
+    ),
+    overflowFinal: stats.overflow,
+    meanOverflowFinal: stats.meanOverflow,
+    FFinal: stats.F,
+    eventDayBlocks: eventDayBlocks,
+    eventsMeta: eventsMeta,
+    dayKeys: dayKeys
+  };
+
+  Logger.log("Resultado pre purga optimización por torres (precalendario lógico):");
+  Logger.log(JSON.stringify(resultPre, null, 2));
+
+
   // FASE DE EMPEQUEÑECIMIENTO DE DIAS LLENOS
   // Una vez que hemos encontrado la distribución optima, algunos dias puede que necesiten más horas que las que hay disponibles, asi que toca filtrar
   // La prioridad será siempre Tasks 5 > Estudio 5 >  Resto de osas
 
+  // Copiamos el overflow para ver que hay cada cosa
+  let overflowNow = stats.overflow || {};
 
+  const extraTimes = {};// para los dias que necesito meter tiempo extra
+
+  // iteramos cada dia por separado probando a ver cuales tienen overflow positivo
+  dayKeys.forEach(dayKey => {
+    let ovMinutes = overflowNow[dayKey] || 0; // los overflows del dia
+    if (ovMinutes <= 0) return; 
+    // Si pasa esto es que toca purgar
+    Logger.log("estoy dentro de un dia de purgado");
+
+    let blocksToRemove = Math.ceil(ovMinutes / 30); // El numero de bloques a quitar
+    Logger.log("bloques a eliminar: " + blocksToRemove);
+    Logger.log("eventDayBlocks: ");
+    Logger.log(JSON.stringify(eventDayBlocks, null, 2));
+    
+
+    // Construimos la lista de candidatos de ese día que pueden perder bloques
+    const candidates = [];
+
+    for (const evId in eventDayBlocks) {
+      const meta = eventMetaById[evId];
+      if (!meta) continue;
+
+      const blocks = eventDayBlocks[evId][dayKey] || 0;
+      if (blocks <= 0) continue;
+
+      const isStudy = (meta.type === "Estudio");
+      const minBlocks = isStudy ? 4 : 2; // El estudio (a primeras) no puede bajar d 2h, el resto no puede bajar de 1h
+
+      if (blocks > minBlocks) {
+        candidates.push({
+          concepto: eventDayBlocks[evId]["concepto"],
+          evId: evId,
+          blocks: blocks,
+          isStudy: isStudy
+        });
+      }
+    }
+
+    Logger.log("candidatos");
+    Logger.log(candidates);
+
+    while (candidates.length > 0 && blocksToRemove > 0){
+      candidates.sort((a, b) => b.blocks - a.blocks);
+      for (let i = 0; i < candidates.length && candidates.length > 0; i++) {
+        const evId  = candidates[i]["evId"];
+        const meta = eventMetaById[evId];
+        const isStudy = (meta.type === "Estudio");
+        const minBlocks = isStudy ? 4 : 2;
+        const currentBlocks = eventDayBlocks[evId][dayKey] || 0;
+        eventDayBlocks[evId][dayKey] = currentBlocks - 1;
+        dayUsedBlocks[dayKey] = (dayUsedBlocks[dayKey] || 0) - 1;
+        Logger.log("bloque purgado: "+ eventDayBlocks[evId]["concepto"]);
+        Logger.log("Bloques antes: " + blocksToRemove);
+        blocksToRemove--;
+        Logger.log("Bloques despues: " + blocksToRemove);
+        if (blocksToRemove === 0) break;
+        if ((currentBlocks - 1) <= minBlocks){
+          Logger.log(candidates);
+          Logger.log("Indice: " + i);
+          Logger.log("destruimos: ");
+          Logger.log(candidates[i]);
+          candidates.splice(i, 1);
+          Logger.log("post delete:");
+          Logger.log(candidates);
+          Logger.log("longitud candidatos: " + candidates.length);
+          break;
+        }   
+      }
+    }
+
+
+    if (blocksToRemove > 0) {
+
+      Logger.log("EventDayBlocks antes del tiempo extra");
+      Logger.log(JSON.stringify(eventDayBlocks, null, 2));
+
+      // Mapa auxiliar para poder ir de evId → meta (deadline, allowedDays, etc.)
+      const metaById = {};
+      eventsMeta.forEach(m => { metaById[m.id] = m; });
+
+      // Distribuye numBlocks de tiempo extra de un evento concreto a lo largo de los días
+      // permitidos hasta su deadline, intentando repartir en paquetes de 2 bloques por día
+      // y balanceando para que no haya un día con mucha sobrecarga si otros aún tienen 0.
+      function distributeExtraBlocks_(evId, originDayKey, numBlocks) {
+        const meta = metaById[evId];
+        // Si por lo que sea no tenemos meta, caemos al comportamiento antiguo (todo al día origen).
+        if (!meta) {
+          extraTimes[evId] = extraTimes[evId] || {
+            concepto: eventDayBlocks[evId]["concepto"]
+          };
+          extraTimes[evId][originDayKey] =
+            (extraTimes[evId][originDayKey] || 0) + numBlocks;
+          return;
+        }
+
+        const deadlineKey = meta.deadline ? dateKeyFromDate_(meta.deadline) : null;
+        const allowedRaw = (meta.allowedDays && meta.allowedDays.length)
+          ? meta.allowedDays
+          : dayKeys; // fallback: todas las dayKeys conocidas
+
+        // Días candidatos: desde el día de origen hasta el deadline (incluido)
+        const candidates = allowedRaw.filter(d =>
+          d >= originDayKey && (!deadlineKey || d <= deadlineKey)
+        );
+
+        extraTimes[evId] = extraTimes[evId] || {
+          concepto: eventDayBlocks[evId]["concepto"]
+        };
+
+        // Si no hay candidatos válidos, metemos todo en el propio día origen
+        if (candidates.length === 0) {
+          extraTimes[evId][originDayKey] =
+            (extraTimes[evId][originDayKey] || 0) + numBlocks;
+          return;
+        }
+
+        // Repartimos: mientras queden bloques, intentamos ponerlos en chunks de 2
+        // y siempre en el día con menor carga extra actual.
+        while (numBlocks > 0) {
+          const chunk = (numBlocks >= 2) ? 2 : 1; // idealmente 2; si queda 1, lo añadimos encima
+
+          // buscamos el día con menor carga extra actual para este evento
+          let bestDay = candidates[0];
+          let bestLoad = extraTimes[evId][bestDay] || 0;
+
+          for (let i = 1; i < candidates.length; i++) {
+            const d = candidates[i];
+            const load = extraTimes[evId][d] || 0;
+            if (load < bestLoad) {
+              bestLoad = load;
+              bestDay = d;
+            }
+          }
+
+          extraTimes[evId][bestDay] =
+            (extraTimes[evId][bestDay] || 0) + chunk;
+          numBlocks -= chunk;
+        }
+      }
+
+      // vamos sacando tiempo extra de ese día hasta 3h (6 bloques) o hasta agotar blocksToRemove
+      let movedExtraBlocks = 0; // máximo 6 bloques (3h)
+
+      while (blocksToRemove > 0 && movedExtraBlocks < 6) {
+        // reconstruimos candidatos restantes del día
+        const remaining = [];
+        for (const evId in eventDayBlocks) {
+          const blocks = eventDayBlocks[evId][dayKey] || 0;
+          if (blocks > 0) {
+            remaining.push({ evId, blocks });
+          }
+        }
+
+        if (remaining.length === 0) break;
+
+        // cogemos el evento con más bloques en ese día
+        remaining.sort((a, b) => b.blocks - a.blocks);
+        const { evId } = remaining[0];
+
+        const available = eventDayBlocks[evId][dayKey] || 0;
+        // no sacar más de lo disponible ni más de lo que falta por quitar ni más de 3h en total
+        let toMove = Math.min(blocksToRemove, 6 - movedExtraBlocks, available);
+        if (toMove <= 0) break;
+
+        // opcional: evitar mover un solo bloque suelto si quieres mantener pares de 2
+        // if (toMove === 1 && blocksToRemove > 1) toMove = 0;
+        // if (toMove <= 0) break;
+
+        // en vez de asignar todo al mismo dayKey, lo repartimos por días hasta el deadline
+        distributeExtraBlocks_(evId, dayKey, toMove);
+
+        eventDayBlocks[evId][dayKey] -= toMove;
+        if (eventDayBlocks[evId][dayKey] <= 0) delete eventDayBlocks[evId][dayKey];
+
+        dayUsedBlocks[dayKey] -= toMove;
+        blocksToRemove -= toMove;
+        movedExtraBlocks += toMove;
+      }
+
+      Logger.log("EventDayBlocks despues del tiempo extra");
+      Logger.log(JSON.stringify(eventDayBlocks, null, 2));
+
+      Logger.log("extraTimes:");
+      Logger.log(JSON.stringify(extraTimes, null, 2));
+    }
+
+
+  });
+
+
+  // Recalcular stats tras meter el extra
+  stats = computeOverflowStats_(dayUsedBlocks);
   // Resultados finales
   const result = {
     freeMinutesByDay: freeMinutesByDay,
@@ -678,6 +897,7 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
     meanOverflowFinal: stats.meanOverflow,
     FFinal: stats.F,
     eventDayBlocks: eventDayBlocks,
+    extraTimes: extraTimes,
     eventsMeta: eventsMeta,
     dayKeys: dayKeys
   };
@@ -725,4 +945,34 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
       sumAbsOverflow: sumAbsOverflow
     };
   }
+
+  // helper para ver si ese dia es usable para ese día
+  function isDayUsableForEvent_(meta, dayKey) {
+  // Si no hay deadline (o no es una fecha válida), no restringimos
+  if (!meta.deadline) return true;
+  const deadline = new Date(meta.deadline);
+  if (isNaN(deadline.getTime())) return true;
+
+  // Solo nos importa el mismo día del deadline; otros días se tratan por fecha en allowedDays
+  const deadlineKey = dateKeyFromDate_(deadline);
+  if (deadlineKey !== dayKey) return true;
+
+  const deadlineTime = deadline.getTime();
+
+  // Buscamos si existe al menos un freeSlot en ese día que empiece antes del deadline
+  for (let i = 0; i < freeSlots.length; i++) {
+    const slot = freeSlots[i];
+    const s = new Date(slot.start);
+    const e = new Date(slot.end);
+    if (dateKeyFromDate_(s) !== dayKey) continue;
+    // Cualquier hueco que empiece antes del deadline se considera usable;
+    // el ajuste fino de minutos ya lo hará scheduleTasksIntoFreeSlots_
+    if (s.getTime() < deadlineTime && e.getTime() > s.getTime()) {
+      return true;
+    }
+  }
+  // No hay huecos reales antes del deadline en ese día → no usarlo en el precalendario
+  return false;
+}
+
 }
