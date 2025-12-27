@@ -1,0 +1,322 @@
+/************ CONFIG ************/
+const CFG2 = {
+  sheetName: "Calendario",     // nombre de la hoja
+  headerRow: 1,                // fila donde están Monday..Sunday
+  timeCol: 1,                  // columna A = horas
+  clearGridBeforeImport: true,
+  maxRowsToScan: 400,
+
+  // Máximo de columnas de "solape" a la derecha que permitimos usar
+  // (si tienes columnas en blanco entre días, esto te crea "carriles" de solape)
+  maxOverlapShift: 12,
+
+  // null = todos los calendarios visibles
+  // ["Tareas", "Estudio"] = solo esos
+  calendarNames: null
+};
+
+/************ ENTRYPOINTS ************/
+function importWeekFromToday() {
+  importWeek_(new Date());
+  Utilities.sleep(500);
+  renderMainDashboard_G4_values();
+}
+
+function importWeekFromCellB1() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG2.sheetName);
+  const v = sh.getRange("B1").getValue();
+  const d = (v instanceof Date) ? v : new Date(v);
+  importWeek_(d);
+}
+
+/************ CORE ************/
+function importWeek_(anyDate) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(CFG2.sheetName);
+  if (!sh) throw new Error(`No existe la hoja "${CFG2.sheetName}"`);
+
+  // Mapas
+  const dayCols = buildDayColumns_(sh);
+  const timeRows = buildTimeRows_(sh);
+
+  // Límites por día para NO invadir el siguiente día al desplazar a la derecha
+  const dayBounds = buildDayBounds_(sh, dayCols);
+
+  // Semana (lunes 00:00 → lunes siguiente)
+  const weekStart = startOfWeekMonday_(anyDate);
+  const weekEnd   = new Date(weekStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+  // LIMPIEZA TOTAL + UNMERGE (incluyendo columnas usadas para solapes)
+  if (CFG2.clearGridBeforeImport) {
+    clearGrid_(sh, timeRows, dayCols, dayBounds);
+  }
+
+  // Calendarios
+  const calendars = getCalendars_();
+
+  // NUEVO: cache de carril por (día + evento)
+  // Garantiza que un evento NO se parta en dos columnas dentro del mismo día.
+  const laneByDayEventKey = {};
+
+  // Importación
+  for (const cal of calendars) {
+    const calName = cal.getName();
+    const events = cal.getEvents(weekStart, weekEnd);
+
+    for (const ev of events) {
+      if (ev.isAllDayEvent && ev.isAllDayEvent()) continue;
+
+      const label = `[${calName}] ${ev.getTitle() || "(Sin título)"}`;
+
+      const s = ceilTo30_(ev.getStartTime());
+      let   e = ceilTo30_(ev.getEndTime());
+
+      if (e <= s) {
+        e = new Date(s.getTime() + 30 * 60 * 1000);
+      }
+
+      // ID estable del evento (si existe); fallback robusto si no.
+      const evId = (typeof ev.getId === "function" && ev.getId())
+        ? ev.getId()
+        : (calName + "||" + (ev.getTitle() || "") + "||" + s.getTime() + "||" + e.getTime());
+
+      let cur = new Date(s);
+      while (cur < e) {
+        const dayKey = dayKeyFromDate_(cur);
+        const baseCol = dayCols[dayKey];
+        const row = timeRows[hhmm_(cur)];
+
+        if (baseCol && row) {
+          // NUEVO: fija carril por (dayKey, evId) la primera vez que aparece ese día
+          const laneKey = dayKey + "||" + evId;
+
+          if (!laneByDayEventKey[laneKey]) {
+            const chosen = findPlacementCol_(sh, row, dayKey, baseCol, dayBounds);
+            laneByDayEventKey[laneKey] = chosen || baseCol;
+          }
+
+          const destCol = laneByDayEventKey[laneKey];
+
+          // Seguridad: no invadir cabecera del siguiente día
+          const b = dayBounds[dayKey];
+          if (b && destCol <= b.rightLimit) {
+            const cell = sh.getRange(row, destCol);
+            const prev = String(cell.getValue() || "").trim();
+
+            // Si ya contiene exactamente ese label, no lo dupliques
+            if (!prev) {
+              cell.setValue(label);
+            } else if (!prev.split("\n").includes(label)) {
+              cell.setValue(prev + "\n" + label);
+            }
+          }
+        }
+
+        cur = new Date(cur.getTime() + 30 * 60 * 1000);
+      }
+    }
+  }
+
+  // MERGE DE BLOQUES CONSECUTIVOS (incluye carriles de solape)
+  mergeConsecutiveCells_(sh, timeRows, dayBounds);
+}
+
+/************ HELPERS ************/
+function buildDayColumns_(sh) {
+  const lastCol = sh.getLastColumn();
+  const headers = sh
+    .getRange(CFG2.headerRow, 1, 1, lastCol)
+    .getDisplayValues()[0];
+
+  const wanted = new Set([
+    "Monday", "Tuesday", "Wednesday",
+    "Thursday", "Friday", "Saturday", "Sunday"
+  ]);
+
+  const map = {};
+  for (let c = 0; c < headers.length; c++) {
+    const h = String(headers[c] || "").trim();
+    if (wanted.has(h)) {
+      map[h] = c + 1;
+    }
+  }
+
+  if (Object.keys(map).length === 0) {
+    throw new Error("No se han encontrado cabeceras Monday..Sunday");
+  }
+
+  return map;
+}
+
+function buildDayBounds_(sh, dayCols) {
+  // Para cada día: [baseCol .. rightLimit]
+  // rightLimit es la columna anterior a la siguiente cabecera de día (para no invadirla),
+  // y en el último día, hasta el lastColumn.
+  const lastCol = sh.getLastColumn();
+
+  const entries = Object.entries(dayCols) // [dayKey, col]
+    .map(([k, c]) => ({ dayKey: k, col: c }))
+    .sort((a, b) => a.col - b.col);
+
+  const bounds = {};
+  for (let i = 0; i < entries.length; i++) {
+    const cur = entries[i];
+    const next = entries[i + 1];
+
+    const baseCol = cur.col;
+    const rightLimit = next ? (next.col - 1) : lastCol;
+
+    bounds[cur.dayKey] = {
+      baseCol,
+      rightLimit
+    };
+  }
+
+  return bounds;
+}
+
+function buildTimeRows_(sh) {
+  const disp = sh
+    .getRange(1, CFG2.timeCol, CFG2.maxRowsToScan, 1)
+    .getDisplayValues()
+    .flat();
+
+  const vals = sh
+    .getRange(1, CFG2.timeCol, CFG2.maxRowsToScan, 1)
+    .getValues()
+    .flat();
+
+  const map = {};
+
+  for (let r = 0; r < disp.length; r++) {
+    const v = String(disp[r] || "").trim();
+    const m = v.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+    if (m) {
+      map[pad2_(m[1]) + ":" + m[2]] = r + 1;
+      continue;
+    }
+
+    const raw = vals[r];
+    if (raw instanceof Date && !isNaN(raw)) {
+      map[pad2_(raw.getHours()) + ":" + pad2_(raw.getMinutes())] = r + 1;
+    }
+  }
+
+  if (Object.keys(map).length === 0) {
+    throw new Error("No hay horas HH:MM en la columna A");
+  }
+
+  return map;
+}
+
+function clearGrid_(sh, timeRows, dayCols, dayBounds) {
+  const rows = Object.values(timeRows);
+  const minRow = Math.min(...rows);
+  const maxRow = Math.max(...rows);
+
+  // Limpia desde la primera columna de día hasta el máximo rightLimit
+  const baseCols = Object.values(dayCols);
+  const minCol = Math.min(...baseCols);
+
+  let maxRight = minCol;
+  for (const b of Object.values(dayBounds)) {
+    if (b.rightLimit > maxRight) maxRight = b.rightLimit;
+  }
+
+  const rng = sh.getRange(minRow, minCol, maxRow - minRow + 1, maxRight - minCol + 1);
+  rng.breakApart();
+  rng.clearContent();
+}
+
+function findPlacementCol_(sh, row, dayKey, baseCol, dayBounds) {
+  const b = dayBounds[dayKey];
+  if (!b) return null;
+
+  const maxShift = CFG2.maxOverlapShift || 0;
+  const rightLimit = b.rightLimit;
+
+  // Intentar baseCol, luego baseCol+1... hasta maxOverlapShift, sin pasar rightLimit
+  for (let shift = 0; shift <= maxShift; shift++) {
+    const col = baseCol + shift;
+    if (col > rightLimit) break;
+
+    const v = String(sh.getRange(row, col).getValue() || "").trim();
+    if (!v) return col;
+  }
+
+  // Si no hay hueco (todo ocupado), lo metemos en baseCol igualmente (apilado)
+  // para no perder eventos
+  return baseCol;
+}
+
+function mergeConsecutiveCells_(sh, timeRows, dayBounds) {
+  const rows = Object.values(timeRows);
+  const minRow = Math.min(...rows);
+  const maxRow = Math.max(...rows);
+  const height = maxRow - minRow + 1;
+
+  // Para cada día, mergeamos columna por columna desde baseCol hasta rightLimit
+  for (const b of Object.values(dayBounds)) {
+    for (let col = b.baseCol; col <= b.rightLimit; col++) {
+      const rng = sh.getRange(minRow, col, height, 1);
+      const vals = rng.getValues();
+
+      let start = 0;
+      for (let i = 1; i <= vals.length; i++) {
+        const cur = i < vals.length ? String(vals[i][0] || "").trim() : null;
+        const base = String(vals[start][0] || "").trim();
+
+        if (cur !== base) {
+          const len = i - start;
+
+          if (len > 1 && base !== "") {
+            for (let k = start + 1; k < i; k++) {
+              vals[k][0] = "";
+            }
+            rng.setValues(vals);
+            sh.getRange(minRow + start, col, len, 1).merge();
+          }
+
+          start = i;
+        }
+      }
+    }
+  }
+}
+
+function getCalendars_() {
+  const all = CalendarApp.getAllCalendars();
+  if (!CFG2.calendarNames) return all;
+  const wanted = new Set(CFG2.calendarNames.map(s => String(s).trim()));
+  return all.filter(c => wanted.has(c.getName()));
+}
+
+function startOfWeekMonday_(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  const day = x.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  x.setDate(x.getDate() + diff);
+  return x;
+}
+
+function ceilTo30_(d) {
+  const x = new Date(d);
+  x.setSeconds(0, 0);
+  const m = x.getMinutes();
+  if (m === 0 || m === 30) return x;
+  x.setMinutes(m < 30 ? 30 : 60);
+  return x;
+}
+
+function hhmm_(d) {
+  return pad2_(d.getHours()) + ":" + pad2_(d.getMinutes());
+}
+
+function pad2_(n) {
+  return String(n).padStart(2, "0");
+}
+
+function dayKeyFromDate_(d) {
+  return ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][d.getDay()];
+}
