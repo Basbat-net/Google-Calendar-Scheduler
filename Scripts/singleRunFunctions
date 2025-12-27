@@ -325,4 +325,242 @@ function clamp(x, lo, hi) {
 
 function roundUpToStep(x, step) {
   return Math.ceil(x / step) * step;
+}/************ CONFIG ************/
+const NEXT_EVENTS_ONOPEN_CFG = {
+  sheetName: "database",
+
+  // Source: start row and columns B..D (in sheetName)
+  rowStart: 1497,
+  colB: 2, // B
+  colC: 3, // C
+  colD: 4, // D
+
+  // Output: hardcoded range J3:N7 (in MainDashboard)
+  outputSheetName: "MainDashboard",
+  outputStartRow: 3,
+  outputStartCol: 10, // J
+  outputNumRows: 5,
+  outputNumCols: 5, // J..N
+
+  // Only include events that start after now
+  includeOngoing: false
+};
+
+/************ MAIN ************/
+function writeNext5UpcomingEventsToJ3N7() {
+  const cfg = NEXT_EVENTS_ONOPEN_CFG;
+
+  const ss = SpreadsheetApp.getActive();
+
+  // READ from database (cfg.sheetName)
+  const shRead = ss.getSheetByName(cfg.sheetName);
+  if (!shRead) throw new Error("Sheet not found (source): " + cfg.sheetName);
+
+  // WRITE to MainDashboard
+  const shWrite = ss.getSheetByName(cfg.outputSheetName);
+  if (!shWrite) throw new Error("Sheet not found (output): " + cfg.outputSheetName);
+
+  const now = new Date();
+
+  // Clear output range J3:N7
+  shWrite.getRange(cfg.outputStartRow, cfg.outputStartCol, cfg.outputNumRows, cfg.outputNumCols).clearContent();
+
+  const lastRow = shRead.getLastRow();
+  Logger.log("writeNext5UpcomingEventsToJ3N7: source lastRow=%s, rowStart=%s", lastRow, cfg.rowStart);
+
+  if (lastRow < cfg.rowStart) {
+    Logger.log("writeNext5UpcomingEventsToJ3N7: EXIT (source lastRow < rowStart). Nothing to read.");
+    return;
+  }
+
+  // We will read BOTH potential blocks:
+  // - Base block:   B/C/D  (cfg.colB, cfg.colB+1, cfg.colB+2)
+  // - Alt block:    J/K/L  (B + 8, C + 8, D + 8)
+  //
+  // Note: although you mentioned "7 columns to the right", the explicit mapping you gave is B<->J,
+  // which is +8 columns (B=2, J=10). We follow the explicit mapping: B and J, C and K, D and L.
+  const ALT_OFFSET_COLS = 8;
+
+  const numRows = lastRow - cfg.rowStart + 1;
+
+  // Read one wide range from base B to alt L in one call for performance.
+  // Width needed: base 3 cols + gap + alt 3 cols = ALT_OFFSET_COLS + 3 (because we start at cfg.colB).
+  // Example if cfg.colB=2 (B) and ALT_OFFSET_COLS=8, width=11 => reads B..L.
+  const width = ALT_OFFSET_COLS + 3;
+  const grid = shRead.getRange(cfg.rowStart, cfg.colB, numRows, width).getValues();
+
+  // Column indexes within `grid` (0-based inside the fetched range)
+  const idxBaseB = 0;
+  const idxBaseC = 1;
+  const idxBaseD = 2;
+
+  const idxAltJ = ALT_OFFSET_COLS + 0;
+  const idxAltK = ALT_OFFSET_COLS + 1;
+  const idxAltL = ALT_OFFSET_COLS + 2;
+
+  const collected = [];
+
+  // Helper: true if cell is empty (same semantics as your original code)
+  function isEmpty_(v) {
+    return !v || String(v).trim() === "";
+  }
+
+  // Helper: scan a single column independently until its first empty cell
+  function scanColumnUntilEmpty_(colIdx, calendarType) {
+    let count = 0;
+
+    for (let i = 0; i < grid.length; i++) {
+      const v = grid[i][colIdx];
+
+      if (isEmpty_(v)) {
+        // Stop condition for THIS column only: first empty cell
+        Logger.log("Stopped %s at sheet row %s (first empty cell in that column).", calendarType, (cfg.rowStart + i));
+        break;
+      }
+
+      const ev = parseLoggedCalendarCell_(String(v), calendarType);
+      if (ev) {
+        collected.push(ev);
+        count++;
+      }
+    }
+
+    Logger.log("Scanned %s columnIdx=%s: parsed=%s", calendarType, colIdx, count);
+  }
+
+  // Extract events equally from both blocks:
+  // General:       B and J
+  // Examenes:      C and K
+  // Laboratorios:  D and L
+  scanColumnUntilEmpty_(idxBaseB, "General");
+  scanColumnUntilEmpty_(idxAltJ,  "General");
+
+  scanColumnUntilEmpty_(idxBaseC, "Examenes");
+  scanColumnUntilEmpty_(idxAltK,  "Examenes");
+
+  scanColumnUntilEmpty_(idxBaseD, "Laboratorios");
+  scanColumnUntilEmpty_(idxAltL,  "Laboratorios");
+
+  Logger.log("Collected parsed events (combined): %s", collected.length);
+
+  // Filter by time
+  const filtered = collected.filter(ev => {
+    if (!ev || !(ev.start instanceof Date) || isNaN(ev.start)) return false;
+
+    if (cfg.includeOngoing) {
+      if (ev.end instanceof Date && !isNaN(ev.end)) return ev.end.getTime() > now.getTime();
+      return ev.start.getTime() > now.getTime();
+    } else {
+      return ev.start.getTime() > now.getTime();
+    }
+  });
+
+  Logger.log("Filtered upcoming events: %s", filtered.length);
+
+  // Sort by proximity (soonest start)
+  filtered.sort((a, b) => a.start.getTime() - b.start.getTime());
+
+  const top = filtered.slice(0, cfg.outputNumRows);
+
+  // Build output matrix 5x5
+  const out = [];
+  for (let i = 0; i < cfg.outputNumRows; i++) {
+    const ev = top[i];
+    if (!ev) {
+      out.push(["", "", "", "", ""]);
+      continue;
+    }
+
+    const minutesUntil = Math.max(0, Math.round((ev.start.getTime() - now.getTime()) / 60000));
+
+    out.push([
+      ev.type,                          // Tipo
+      ev.title,                         // Concepto
+      formatDate_(ev.start),            // Fecha
+      formatTime_(ev.start),            // Hora
+      formatMinutesAsDHM_(minutesUntil) // T until
+    ]);
+  }
+
+  // Write to J3:N7
+  shWrite.getRange(cfg.outputStartRow, cfg.outputStartCol, cfg.outputNumRows, cfg.outputNumCols).setValues(out);
+  Logger.log("Wrote %s rows to %s!J3:N7", out.length, cfg.outputSheetName);
+}
+
+
+/************ PARSER ************/
+/**
+ * Parses a cell block like:
+ * [GOOGLE CALENDAR EVENT]
+ * title: ...
+ * id: ...
+ * start: ...
+ * end: ...
+ */
+function parseLoggedCalendarCell_(cellText, typeName) {
+  const text = String(cellText || "").trim();
+  if (!text) return null;
+
+  const title = extractField_(text, "title");
+  const id    = extractField_(text, "id");
+  const startStr = extractField_(text, "start");
+  const endStr   = extractField_(text, "end");
+
+  const start = startStr ? new Date(startStr) : null;
+  const end   = endStr ? new Date(endStr) : null;
+
+  if (!(start instanceof Date) || isNaN(start)) return null;
+
+  return {
+    type: typeName,
+    title: title || "",
+    id: id || "",
+    start: start,
+    end: (end instanceof Date && !isNaN(end)) ? end : null
+  };
+}
+
+function extractField_(text, fieldName) {
+  const re = new RegExp("^\\s*" + escapeRegExp_(fieldName) + "\\s*:\\s*(.*)\\s*$", "mi");
+  const m = text.match(re);
+  return m ? (m[1] || "").trim() : "";
+}
+
+function escapeRegExp_(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/************ FORMAT ************/
+function formatDate_(d) {
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yy = d.getFullYear();
+  return `${dd}/${mm}/${yy}`;
+}
+
+function formatTime_(d) {
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mi}`;
+}
+
+/**
+ * Formats minutes as "Xd Yh Zm" (omits zero units except minutes if everything is zero).
+ * Examples: "2d 3h 15m", "5h 20m", "12m"
+ */
+function formatMinutesAsDHM_(totalMinutes) {
+  let mins = Math.max(0, totalMinutes);
+
+  const days = Math.floor(mins / 1440);
+  mins -= days * 1440;
+
+  const hours = Math.floor(mins / 60);
+  mins -= hours * 60;
+
+  const parts = [];
+  if (days > 0) parts.push(days + "d");
+  if (hours > 0) parts.push(hours + "h");
+  if (mins > 0 || parts.length === 0) parts.push(mins + "m");
+
+  return parts.join(" ");
 }
