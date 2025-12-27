@@ -12,21 +12,21 @@ const COL_PROGRESO = 6;
 
 const INTERVALOS_USABLES_ENTRE_SEMANA =         
         [ { startHour: 9,  startMinute: 30, endHour: 14, endMinute: 0 },
-          { startHour: 15, startMinute: 0,  endHour: 22, endMinute: 0 }];
+          { startHour: 15, startMinute: 0,  endHour: 24, endMinute: 0 }];
 const INTERVALOS_USABLES_FINDES =         
-        [ { startHour: 11, startMinute: 30, endHour: 14, endMinute: 0 },
+        [ { startHour: 9, startMinute: 30, endHour: 14, endMinute: 0 },
           { startHour: 15, startMinute: 0,  endHour: 24, endMinute: 0 }];
 
 
 //Calendarios estáticos para planificar entorno a ellos
 // están con numero porque algunos calendarios les he querido meter padding (offset x delante y detrás)
-const FIXED_CALENDARS = {"Clases":0,"General":0,"Laboratorio":0,"Laboratorios":0,"Examenes":1}
+const FIXED_CALENDARS = {"Clases":0,"General":1,"Laboratorio":0,"Laboratorios":0,"Examenes":1}
 // IMPORTANTE: Los nombres de los examenes deben ser iguales a los de este array, si no se te va a rallar
 const SUBJECTS = [
-  "circuitos", "ciencia", "regu", "resis", "termo","analogica" ];
+  "circuitos", "ciencia", "regu", "resis", "termo","analogica","tmm"];
 
 
-const BASE_STUDY_HOURS = [0,3,5,0,10,15]; // el indice n es el numero de horas para las cosas de prioridad n (prio 1->3h en el ejemplo)
+const BASE_STUDY_HOURS = [0,3,5,8,10,15]; // el indice n es el numero de horas para las cosas de prioridad n (prio 1->3h en el ejemplo)
 
 //Calendarios dinámicos donde se hace el planning como tal
 const TASK_CALENDAR_NAME = "Tareas";
@@ -37,7 +37,7 @@ const EXAM_CALENDAR_NAME = "Examenes";
 const HORIZON_DAYS = 8;         // Con cuantos días de antelación opera el calendario
 const BLOCK_MINUTES = 30;       // bloque minimo de trabajo para organizar
 
-const NOW_OFFSET_HOURS = -0.5; // hay un bug ahora de que empieza en la media hora siguiente a la actual, lo dejo
+const NOW_OFFSET_HOURS = 3; // hay un bug ahora de que empieza en la media hora siguiente a la actual, lo dejo
                                // en -0.5 para corregirlo, pero en teoría debería ser 0
 
 const calendarByType = {};
