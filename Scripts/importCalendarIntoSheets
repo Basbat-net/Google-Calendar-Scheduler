@@ -12,7 +12,18 @@ const CFG2 = {
 
   // null = todos los calendarios visibles
   // ["Tareas", "Estudio"] = solo esos
-  calendarNames: null
+  calendarNames: null,
+
+  // Subjects source
+  subjectsSheetName: "database",
+  subjectsRangeA1: "J5:J12",
+
+  // NUEVO: salida en MainDashboard
+  outputSheetName: "MainDashboard",
+  outEstudioA1: "J16",
+  outProyectoA1: "M19",
+  outTareasA1: "M20",
+  outSubjectsStartA1: "M11" // M11:M18
 };
 
 /************ ENTRYPOINTS ************/
@@ -20,6 +31,8 @@ function importWeekFromToday() {
   importWeek_(new Date());
   Utilities.sleep(500);
   renderMainDashboard_G4_values();
+  Utilities.sleep(500);
+  updateEstudioWeekAndTotalSums();
 }
 
 function importWeekFromCellB1() {
@@ -34,6 +47,26 @@ function importWeek_(anyDate) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(CFG2.sheetName);
   if (!sh) throw new Error(`No existe la hoja "${CFG2.sheetName}"`);
+
+  // NUEVO: exportar lista de asignaturas desde database!J5:J12 antes de importar (preservando orden)
+  const subjectsInfo = getSubjectsFromDatabaseWithOrder_(); // { list, rawValues }
+  const subjects = subjectsInfo.list;         // lista ordenada, sin vacíos, sin duplicados
+  const rawOrdered = subjectsInfo.rawValues;  // exactamente J5:J12 (trimmed), para mapear M11:M18 por índice
+
+  // NUEVO: contadores (30-min blocks)
+  const counters = {
+    byType30m: {
+      "Estudio": 0,
+      "Proyecto": 0,
+      "Tareas": 0
+    },
+    bySubject30m: {} // solo Estudio, por asignatura
+  };
+
+  // Inicializa contadores por asignatura (para que salgan 0 explícitos)
+  for (const s of subjects) {
+    counters.bySubject30m[s] = 0;
+  }
 
   // Mapas
   const dayCols = buildDayColumns_(sh);
@@ -54,8 +87,7 @@ function importWeek_(anyDate) {
   // Calendarios
   const calendars = getCalendars_();
 
-  // NUEVO: cache de carril por (día + evento)
-  // Garantiza que un evento NO se parta en dos columnas dentro del mismo día.
+  // cache de carril por (día + evento)
   const laneByDayEventKey = {};
 
   // Importación
@@ -66,7 +98,8 @@ function importWeek_(anyDate) {
     for (const ev of events) {
       if (ev.isAllDayEvent && ev.isAllDayEvent()) continue;
 
-      const label = `[${calName}] ${ev.getTitle() || "(Sin título)"}`;
+      const title = String(ev.getTitle() || "").trim();
+      const label = `[${calName}] ${title || "(Sin título)"}`;
 
       const s = ceilTo30_(ev.getStartTime());
       let   e = ceilTo30_(ev.getEndTime());
@@ -87,7 +120,6 @@ function importWeek_(anyDate) {
         const row = timeRows[hhmm_(cur)];
 
         if (baseCol && row) {
-          // NUEVO: fija carril por (dayKey, evId) la primera vez que aparece ese día
           const laneKey = dayKey + "||" + evId;
 
           if (!laneByDayEventKey[laneKey]) {
@@ -100,10 +132,22 @@ function importWeek_(anyDate) {
           // Seguridad: no invadir cabecera del siguiente día
           const b = dayBounds[dayKey];
           if (b && destCol <= b.rightLimit) {
+            // CONTAR BLOQUES (30 min) de Estudio/Proyecto/Tareas
+            if (calName === "Estudio" || calName === "Proyecto" || calName === "Tareas") {
+              counters.byType30m[calName] = (counters.byType30m[calName] || 0) + 1;
+
+              // CONTAR por asignatura (solo Estudio) si coincide con la lista
+              if (calName === "Estudio") {
+                const concept = title;
+                if (concept && Object.prototype.hasOwnProperty.call(counters.bySubject30m, concept)) {
+                  counters.bySubject30m[concept] += 1;
+                }
+              }
+            }
+
             const cell = sh.getRange(row, destCol);
             const prev = String(cell.getValue() || "").trim();
 
-            // Si ya contiene exactamente ese label, no lo dupliques
             if (!prev) {
               cell.setValue(label);
             } else if (!prev.split("\n").includes(label)) {
@@ -119,9 +163,65 @@ function importWeek_(anyDate) {
 
   // MERGE DE BLOQUES CONSECUTIVOS (incluye carriles de solape)
   mergeConsecutiveCells_(sh, timeRows, dayBounds);
+
+  // NUEVO: salida a MainDashboard en HORAS
+  writeWeeklyCountsToMainDashboard_(ss, counters, rawOrdered);
 }
 
 /************ HELPERS ************/
+function writeWeeklyCountsToMainDashboard_(ss, counters, rawOrderedSubjects) {
+  const shOut = ss.getSheetByName("MainDashboard");
+  if (!shOut) throw new Error(`No existe la hoja "${CFG2.outputSheetName}"`);
+
+  const toHours = (n30) => (Number(n30 || 0) * 0.5);
+
+  // Totales por tipo
+  shOut.getRange(CFG2.outEstudioA1).setValue(toHours(counters.byType30m["Estudio"] || 0));
+  shOut.getRange(CFG2.outProyectoA1).setValue(toHours(counters.byType30m["Proyecto"] || 0));
+  shOut.getRange(CFG2.outTareasA1).setValue(toHours(counters.byType30m["Tareas"] || 0));
+
+  // Asignaturas: M11:M18 mapeado por índice con database!J5:J12 (mismo orden)
+  const start = shOut.getRange(CFG2.outSubjectsStartA1);
+  const startRow = start.getRow();
+  const startCol = start.getColumn();
+
+  const outVals = [];
+  for (let i = 0; i < rawOrderedSubjects.length; i++) {
+    const subj = String(rawOrderedSubjects[i] || "").trim();
+    if (!subj) {
+      outVals.push([""]); // si en J hay vacío, deja vacío en M
+      continue;
+    }
+    const n30 = (counters.bySubject30m && Object.prototype.hasOwnProperty.call(counters.bySubject30m, subj))
+      ? counters.bySubject30m[subj]
+      : 0;
+    outVals.push([toHours(n30)]);
+  }
+
+  shOut.getRange(startRow, startCol, outVals.length, 1).setValues(outVals);
+}
+
+function getSubjectsFromDatabaseWithOrder_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(CFG2.subjectsSheetName);
+  if (!sh) throw new Error(`No existe la hoja "${CFG2.subjectsSheetName}"`);
+
+  const raw = sh.getRange(CFG2.subjectsRangeA1).getValues().flat();
+  const rawTrimmed = raw.map(v => String(v || "").trim());
+
+  // lista sin vacíos y sin duplicados, preservando primer orden de aparición
+  const list = [];
+  const seen = new Set();
+  for (const s of rawTrimmed) {
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    list.push(s);
+  }
+
+  return { list, rawValues: rawTrimmed };
+}
+
 function buildDayColumns_(sh) {
   const lastCol = sh.getLastColumn();
   const headers = sh
@@ -149,12 +249,9 @@ function buildDayColumns_(sh) {
 }
 
 function buildDayBounds_(sh, dayCols) {
-  // Para cada día: [baseCol .. rightLimit]
-  // rightLimit es la columna anterior a la siguiente cabecera de día (para no invadirla),
-  // y en el último día, hasta el lastColumn.
   const lastCol = sh.getLastColumn();
 
-  const entries = Object.entries(dayCols) // [dayKey, col]
+  const entries = Object.entries(dayCols)
     .map(([k, c]) => ({ dayKey: k, col: c }))
     .sort((a, b) => a.col - b.col);
 
@@ -214,7 +311,6 @@ function clearGrid_(sh, timeRows, dayCols, dayBounds) {
   const minRow = Math.min(...rows);
   const maxRow = Math.max(...rows);
 
-  // Limpia desde la primera columna de día hasta el máximo rightLimit
   const baseCols = Object.values(dayCols);
   const minCol = Math.min(...baseCols);
 
@@ -235,7 +331,6 @@ function findPlacementCol_(sh, row, dayKey, baseCol, dayBounds) {
   const maxShift = CFG2.maxOverlapShift || 0;
   const rightLimit = b.rightLimit;
 
-  // Intentar baseCol, luego baseCol+1... hasta maxOverlapShift, sin pasar rightLimit
   for (let shift = 0; shift <= maxShift; shift++) {
     const col = baseCol + shift;
     if (col > rightLimit) break;
@@ -244,8 +339,6 @@ function findPlacementCol_(sh, row, dayKey, baseCol, dayBounds) {
     if (!v) return col;
   }
 
-  // Si no hay hueco (todo ocupado), lo metemos en baseCol igualmente (apilado)
-  // para no perder eventos
   return baseCol;
 }
 
@@ -255,7 +348,6 @@ function mergeConsecutiveCells_(sh, timeRows, dayBounds) {
   const maxRow = Math.max(...rows);
   const height = maxRow - minRow + 1;
 
-  // Para cada día, mergeamos columna por columna desde baseCol hasta rightLimit
   for (const b of Object.values(dayBounds)) {
     for (let col = b.baseCol; col <= b.rightLimit; col++) {
       const rng = sh.getRange(minRow, col, height, 1);
