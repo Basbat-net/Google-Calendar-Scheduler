@@ -384,7 +384,7 @@ function renderMainDashboard_G4_values() {
     } else {
       try {
         const endRow = getMergeEnd("Calendario", col, r);
-        const idx = endRow - 1; // 1-based -> 0-based
+        const idx = endRow; // 1-based -> 0-based
         value = calA[idx]?.[0] ?? "";
       } catch (e) {
         value = "";
@@ -396,28 +396,359 @@ function renderMainDashboard_G4_values() {
 
   shMain.getRange('G4:G22').setValues(output);
 
-  // ─────────────────────────────────────────────
-  // CONTADORES SEMANALES
-  // ─────────────────────────────────────────────
-  try {
-    const countEstudio  = countTaggedSlots_WholeWeek_BtoO_("Estudio");
-    const countProyecto = countTaggedSlots_WholeWeek_BtoO_("Proyecto");
-    const countTareas   = countTaggedSlots_WholeWeek_BtoO_("Tareas");
-    const countFromNowEstudio = countTaggedSlots_WholeWeek_BtoO_("Estudio", null);
-    const countFromNowProyecto = countTaggedSlots_WholeWeek_BtoO_("Proyecto", null);
-    const countFromNowTareas = countTaggedSlots_WholeWeek_BtoO_("Tareas", null);
-    shMain.getRange('L11').setValue(countEstudio);
-    shMain.getRange('L12').setValue(countProyecto);
-    shMain.getRange('L13').setValue(countTareas);
-    shMain.getRange('N11').setValue(countFromNowEstudio);
-    shMain.getRange('N12').setValue(countFromNowProyecto);
-    shMain.getRange('N13').setValue(countFromNowTareas);
-  } catch (e) {
-    shMain.getRange('L11:L13').setValues([[""], [""], [""]]);
-  }
 }
 
 
+/**
+ * Para cada concepto en K11:K18:
+ *  - Suma semanal (desde el último lunes inclusive) de Estudio en L11:L18
+ *  - Suma total histórica (sin filtro de fecha) de Estudio en N11:N18
+ *
+ * Extra:
+ *  - Suma semanal TOTAL de Estudio (todos los conceptos) -> J14
+ *  - Suma total histórica de Estudio (todos los conceptos) -> J18
+ *
+ * NUEVO:
+ *  - Suma semanal TOTAL de Proyecto -> L19
+ *  - Suma total histórica de Proyecto -> N19
+ *  - Suma semanal TOTAL de Tareas -> L20
+ *  - Suma total histórica de Tareas -> N20
+ *
+ * ANTES DE ESCRIBIR RESULTADOS:
+ *  - Lee 'MainDashboard'!D4:H49
+ *  - Recorta por la primera fila vacía en columna D
+ *  - Cuenta intervalos de 30 min para:
+ *      * Proyecto / Tareas (por tipo)
+ *      * Estudio TOTAL (por tipo)
+ *      * Estudio POR ASIGNATURA: tipo=Estudio y concepto (col D) ∈ K11:K18
+ *
+ * AHORA:
+ *  - SUMA (MainDashboard + Database) y vuelca la SUMA al sheet (archivo)
+ *
+ * DATABASE ('database'!A1001:F1491):
+ *  - A: Fecha
+ *  - B: Concepto
+ *  - C: Tipo  (se filtra por "Estudio" / "Proyecto" / "Tareas")
+ *  - F: Duración (horas)
+ */
+function updateEstudioWeekAndTotalSums() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getActiveSheet();
+  const db = ss.getSheetByName("database");
+  if (!db) throw new Error("No existe la hoja 'database'.");
 
+  /***********************
+   * 1) INPUT CONCEPTOS (para DB y para dashboard por-asignatura)
+   ***********************/
+  const START_ROW = 11;
+  const END_ROW   = 18;
+  const numRows   = END_ROW - START_ROW + 1;
 
+  // K = 11
+  const conceptos = sh
+    .getRange(START_ROW, 11, numRows, 1) // K11:K18
+    .getValues()
+    .flat()
+    .map(v => (v || "").toString().trim());
+
+  const conceptosSet = new Set(conceptos.filter(Boolean));
+
+  /***********************
+   * 0) PRE-CHECK DASHBOARD (contadores en HORAS)
+   ***********************/
+  const shMain = ss.getSheetByName("MainDashboard");
+  if (!shMain) throw new Error("No existe la hoja 'MainDashboard'.");
+
+  const DASH_START_ROW = 4;
+  const DASH_END_ROW   = 49;
+  const dashNumRows = DASH_END_ROW - DASH_START_ROW + 1;
+
+  // D:E:F:G:H -> Concepto, Tipo, Inicio, Final, Done?
+  const dashVals = shMain.getRange(DASH_START_ROW, 4, dashNumRows, 5).getValues();
+
+  function norm_(v) {
+    return (v == null ? "" : String(v))
+      .replace(/\u00A0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // primera fila vacía en D
+  let firstEmptyIdx = -1;
+  for (let i = 0; i < dashVals.length; i++) {
+    const conceptoCell = norm_(dashVals[i][0]); // col D
+    if (!conceptoCell) {
+      firstEmptyIdx = i;
+      break;
+    }
+  }
+  const effectiveLen = (firstEmptyIdx === -1) ? dashVals.length : firstEmptyIdx;
+
+  const HALF_HOUR_MS = 30 * 60 * 1000;
+
+  function intervals30mBetween_(startVal, endVal) {
+    if (!(startVal instanceof Date) || !(endVal instanceof Date)) return 0;
+
+    let diffMs = endVal.getTime() - startVal.getTime();
+    if (diffMs < 0) diffMs += 24 * 60 * 60 * 1000;
+
+    const intervals = Math.round(diffMs / HALF_HOUR_MS);
+    if (!isFinite(intervals) || intervals < 0) return 0;
+    return intervals;
+  }
+
+  // Contadores del dashboard en INTERVALOS
+  let dashEstudioIntervals  = 0;
+  let dashProyectoIntervals = 0;
+  let dashTareasIntervals   = 0;
+
+  // Estudio por asignatura (intervalos)
+  const dashEstudioBySubjectIntervals = {};
+  for (const c of conceptos) {
+    const key = (c || "").toString().trim();
+    if (key) dashEstudioBySubjectIntervals[key] = 0;
+  }
+
+  Logger.log("---- DASHBOARD DEBUG (MainDashboard D4:H49) effectiveLen=%s ----", effectiveLen);
+
+  for (let i = 0; i < effectiveLen; i++) {
+    const row = dashVals[i];
+
+    const conceptoRaw = row[0]; // D
+    const tipoRaw     = row[1]; // E
+    const ini         = row[2]; // F
+    const fin         = row[3]; // G
+    const doneRaw     = row[4]; // H
+
+    const concepto = norm_(conceptoRaw);
+    const tipo     = norm_(tipoRaw);
+    const done = (doneRaw === true || doneRaw === "TRUE" || doneRaw === 1);
+
+    let intervals = 0;
+
+    if (done && (tipo === "Estudio" || tipo === "Proyecto" || tipo === "Tareas")) {
+      intervals = intervals30mBetween_(ini, fin);
+
+      if (tipo === "Estudio") {
+        dashEstudioIntervals += intervals;
+
+        if (conceptosSet.has(concepto)) {
+          if (dashEstudioBySubjectIntervals[concepto] == null) dashEstudioBySubjectIntervals[concepto] = 0;
+          dashEstudioBySubjectIntervals[concepto] += intervals;
+        }
+      } else if (tipo === "Proyecto") {
+        dashProyectoIntervals += intervals;
+      } else if (tipo === "Tareas") {
+        dashTareasIntervals += intervals;
+      }
+    }
+
+    Logger.log(
+      "Row %s: concepto='%s' | tipoRaw='%s' (norm='%s') | doneRaw=%s | ini=%s | fin=%s | intervals=%s",
+      DASH_START_ROW + i,
+      concepto,
+      tipoRaw,
+      tipo,
+      doneRaw,
+      ini,
+      fin,
+      intervals
+    );
+  }
+
+  // Convertimos a HORAS (0.5h por intervalo)
+  const dashEstudioHours  = dashEstudioIntervals * 0.5;
+  const dashProyectoHours = dashProyectoIntervals * 0.5;
+  const dashTareasHours   = dashTareasIntervals * 0.5;
+
+  const dashEstudioBySubjectHours = {};
+  for (const subj of conceptos) {
+    const key = (subj || "").toString().trim();
+    if (!key) continue;
+    const ints = Number(dashEstudioBySubjectIntervals[key]) || 0;
+    dashEstudioBySubjectHours[key] = ints * 0.5;
+  }
+
+  Logger.log(
+    "MainDashboard totals: Estudio=%s intervalos (%s h), Proyecto=%s intervalos (%s h), Tareas=%s intervalos (%s h)",
+    dashEstudioIntervals,  dashEstudioHours.toFixed(2),
+    dashProyectoIntervals, dashProyectoHours.toFixed(2),
+    dashTareasIntervals,   dashTareasHours.toFixed(2)
+  );
+
+  Logger.log("MainDashboard Estudio por asignatura (solo concepto ∈ K11:K18):");
+  for (const subj of conceptos) {
+    const key = (subj || "").toString().trim();
+    if (!key) continue;
+    const h = Number(dashEstudioBySubjectHours[key]) || 0;
+    Logger.log("  - %s: %s h", key, h.toFixed(2));
+  }
+
+  /***********************
+   * 2) DB: Ventana temporal desde último lunes
+   ***********************/
+  const now = new Date();
+
+  const minDate = new Date(now);
+  const dow = minDate.getDay();
+  const daysSinceMonday = (dow + 6) % 7; // Lun->0, Mar->1, ..., Dom->6
+  minDate.setDate(minDate.getDate() - daysSinceMonday);
+  minDate.setHours(0, 0, 0, 0);
+
+  const dbValues = db.getRange("A1001:F1491").getValues();
+
+  // totales globales DB (horas)
+  let totalEstudioWeek_allConcepts_DB = 0; // -> J14 (si lo usas)
+  let totalEstudioAll_allConcepts_DB  = 0; // -> J18 (si lo usas)
+
+  let totalProyectoWeek_all_DB = 0; // -> L19
+  let totalProyectoAll_all_DB  = 0; // -> N19
+  let totalTareasWeek_all_DB   = 0; // -> L20
+  let totalTareasAll_all_DB    = 0; // -> N20
+
+  // --- calcular por concepto (Estudio) en DB ---
+  const weeklyOut = [];
+  const totalOut  = [];
+
+  // aquí guardamos también los sumatorios DB por asignatura para logging final
+  const estudioWeekBySubject_DB = {};
+  const estudioAllBySubject_DB  = {};
+  for (const c of conceptos) {
+    const key = (c || "").toString().trim();
+    if (key) {
+      estudioWeekBySubject_DB[key] = 0;
+      estudioAllBySubject_DB[key] = 0;
+    }
+  }
+
+  for (const concepto of conceptos) {
+    if (!concepto) {
+      weeklyOut.push([""]);
+      totalOut.push([""]);
+      continue;
+    }
+
+    let sumWeek_DB = 0;
+    let sumAll_DB  = 0;
+
+    for (const row of dbValues) {
+      const fecha      = row[0]; // A
+      const conceptoDB = (row[1] || "").toString().trim(); // B
+      const tipo       = row[2]; // C
+      const duracion   = Number(row[5]) || 0; // F (horas)
+
+      if (tipo !== "Estudio") continue;
+      if (conceptoDB !== concepto) continue;
+
+      sumAll_DB += duracion;
+
+      if (fecha instanceof Date && fecha >= minDate && fecha <= now) {
+        sumWeek_DB += duracion;
+      }
+    }
+
+    // Guardamos para log
+    estudioWeekBySubject_DB[concepto] = sumWeek_DB;
+    estudioAllBySubject_DB[concepto]  = sumAll_DB;
+
+    // Totales globales de Estudio (DB)
+    totalEstudioAll_allConcepts_DB  += sumAll_DB;
+    totalEstudioWeek_allConcepts_DB += sumWeek_DB;
+
+    // --- SUMA: DB + MainDashboard (por asignatura) ---
+    // Nota: los bloques del dashboard no tienen fecha real (salen en 1899), así que por diseño
+    // los sumamos tanto a semana como a total (son “no logueados” aún).
+    const dashH = Number(dashEstudioBySubjectHours[concepto]) || 0;
+
+    const sumWeek_TOTAL = sumWeek_DB + dashH;
+    const sumAll_TOTAL  = sumAll_DB + dashH;
+
+    weeklyOut.push([sumWeek_TOTAL]);
+    totalOut.push([sumAll_TOTAL]);
+  }
+
+  /***********************
+   * 3) SUMA: DB + MainDashboard (Proyecto / Tareas totales)
+   ***********************/
+  for (const row of dbValues) {
+    const fecha    = row[0]; // A
+    const tipo     = (row[2] || "").toString().trim(); // C
+    const duracion = Number(row[5]) || 0; // F (horas)
+
+    const inThisWeek = (fecha instanceof Date && fecha >= minDate && fecha <= now);
+
+    if (tipo === "Proyecto") {
+      totalProyectoAll_all_DB += duracion;
+      if (inThisWeek) totalProyectoWeek_all_DB += duracion;
+    } else if (tipo === "Tareas") {
+      totalTareasAll_all_DB += duracion;
+      if (inThisWeek) totalTareasWeek_all_DB += duracion;
+    }
+  }
+
+  // SUMA: DB + Dashboard (en horas)
+  // Igual que con Estudio: se suman a semana y a total porque son “no logueados aún”.
+  const totalProyectoWeek_TOTAL = totalProyectoWeek_all_DB + dashProyectoHours;
+  const totalProyectoAll_TOTAL  = totalProyectoAll_all_DB  + dashProyectoHours;
+
+  const totalTareasWeek_TOTAL = totalTareasWeek_all_DB + dashTareasHours;
+  const totalTareasAll_TOTAL  = totalTareasAll_all_DB  + dashTareasHours;
+
+  const totalEstudioWeek_allConcepts_TOTAL = totalEstudioWeek_allConcepts_DB + dashEstudioHours;
+  const totalEstudioAll_allConcepts_TOTAL  = totalEstudioAll_allConcepts_DB  + dashEstudioHours;
+
+  /***********************
+   * 4) OUTPUT (archivo / sheet)
+   ***********************/
+  // Por asignatura
+  sh.getRange(START_ROW, 12, numRows, 1).setValues(weeklyOut); // L11:L18 (DB + Dashboard)
+  sh.getRange(START_ROW, 14, numRows, 1).setValues(totalOut);  // N11:N18 (DB + Dashboard)
+
+  // Totales Proyecto/Tareas (DB + Dashboard)
+  sh.getRange("L19").setValue(totalProyectoWeek_TOTAL);
+  sh.getRange("N19").setValue(totalProyectoAll_TOTAL);
+  sh.getRange("L20").setValue(totalTareasWeek_TOTAL);
+  sh.getRange("N20").setValue(totalTareasAll_TOTAL);
+
+  // Si quieres también los totales de Estudio (DB + Dashboard), descomenta:
+  // sh.getRange("J14").setValue(totalEstudioWeek_allConcepts_TOTAL);
+  // sh.getRange("J18").setValue(totalEstudioAll_allConcepts_TOTAL);
+
+  /***********************
+   * 5) LOG FINAL (para verificar sumas)
+   ***********************/
+  Logger.log("---- SUMA FINAL (DB + MainDashboard) ----");
+  Logger.log(
+    "Estudio TOTAL: semana=%s h, total=%s h",
+    totalEstudioWeek_allConcepts_TOTAL.toFixed(2),
+    totalEstudioAll_allConcepts_TOTAL.toFixed(2)
+  );
+  Logger.log(
+    "Proyecto TOTAL: semana=%s h, total=%s h",
+    totalProyectoWeek_TOTAL.toFixed(2),
+    totalProyectoAll_TOTAL.toFixed(2)
+  );
+  Logger.log(
+    "Tareas TOTAL: semana=%s h, total=%s h",
+    totalTareasWeek_TOTAL.toFixed(2),
+    totalTareasAll_TOTAL.toFixed(2)
+  );
+
+  Logger.log("Estudio por asignatura (DB + MainDashboard):");
+  for (const subj of conceptos) {
+    const key = (subj || "").toString().trim();
+    if (!key) continue;
+
+    const dbW = Number(estudioWeekBySubject_DB[key]) || 0;
+    const dbA = Number(estudioAllBySubject_DB[key]) || 0;
+    const dh  = Number(dashEstudioBySubjectHours[key]) || 0;
+
+    Logger.log(
+      "  - %s: semana=%s h (DB=%s + Dash=%s), total=%s h (DB=%s + Dash=%s)",
+      key,
+      (dbW + dh).toFixed(2), dbW.toFixed(2), dh.toFixed(2),
+      (dbA + dh).toFixed(2), dbA.toFixed(2), dh.toFixed(2)
+    );
+  }
+}
 
