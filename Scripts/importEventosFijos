@@ -240,6 +240,32 @@ function logUpcomingCalendarEventsToDatabase() {
  *   only delete-from-indexados + move-to-no-indexados if programTime is from YESTERDAY
  *   relative to the run day (GMT+1 / script timezone).
  */
+/**
+ * Reemplaza (o añade) la línea "programTime: ..." en un texto de tarea.
+ * - Si existe, la sustituye por programTime: <now>
+ * - Si no existe, la añade al final.
+ */
+function replaceOrSetProgramTimeLine_(taskText, now) {
+  const lines = String(taskText || "").split("\n");
+  const newLine = "programTime: " + safeStr_(new Date(now.getTime()));
+
+  let replaced = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith("programTime: ")) {
+      lines[i] = newLine;
+      replaced = true;
+      break;
+    }
+  }
+
+  if (!replaced) {
+    lines.push(newLine);
+  }
+
+  return lines.join("\n");
+}
+
 function processTasksToDatabase_(db, now) {
   const numRows = ROW_END - ROW_START + 1;
 
@@ -251,11 +277,9 @@ function processTasksToDatabase_(db, now) {
   const currentByConcepto = snapshot.currentByConcepto;
   const orderedLogs = snapshot.orderedLogs;
 
-  // ✅ NUEVO: dayKey “hoy” y “ayer” (zona local del script; GMT+1 si tu TZ es Europe/Madrid)
+  // ✅ dayKey “hoy” (zona local del script; GMT+1 si tu TZ es Europe/Madrid)
   const todayKey = dateKeyFromDate_(now);
-  const y = new Date(now.getTime());
-  y.setDate(y.getDate() - 1);
-  const yesterdayKey = dateKeyFromDate_(y);
+  Logger.log("processTasksToDatabase_: now=%s todayKey=%s", now, todayKey);
 
   const checkRange = db.getRange(ROW_START, checkColIndex, numRows, 1);
   const checkVals = checkRange.getValues();
@@ -268,59 +292,171 @@ function processTasksToDatabase_(db, now) {
     if (!cell) continue;
 
     const text = String(cell);
-    const key = normalizeLogKey_(text);
 
+    const oldMeta = parseTaskMeta_(text);
+
+    // ✅ LOGS: programTime evaluation
+    Logger.log(
+      "G[%s] concepto='%s' programTimeMs=%s programDayKey='%s' todayKey='%s'",
+      (ROW_START + i),
+      (oldMeta.concepto || ""),
+      (isFiniteNumber_(oldMeta.programTimeMs) ? String(oldMeta.programTimeMs) : "NaN"),
+      (oldMeta.programDayKey || ""),
+      todayKey
+    );
+
+    // ✅ NEW TOP RULE (your request):
+    // Si el Concepto existe en el snapshot actual (o sea, coincide con una tarea recuperada),
+    // y programTime es de un día distinto a hoy, entonces se BORRA de G (se compacta hacia arriba).
+    // No altera el resto de reglas: simplemente hace "continue" antes de la lógica existente.
+    const hasProgramDay = !!oldMeta.programDayKey;
+    const conceptoIsInSnapshot = !!oldMeta.concepto && currentByConcepto.has(oldMeta.concepto);
+    const programDayIsNotToday = hasProgramDay && (oldMeta.programDayKey !== todayKey);
+
+    if (conceptoIsInSnapshot && programDayIsNotToday) {
+      Logger.log(
+        "G[%s] DELETE (top rule): concepto='%s' is in snapshot and programDayKey='%s' != todayKey='%s'",
+        (ROW_START + i),
+        oldMeta.concepto,
+        oldMeta.programDayKey,
+        todayKey
+      );
+      continue; // NO se añade a keptIndexados => se elimina de G por compactado
+    }
+
+    const key = taskDedupeKeyFromText_(text);
+
+    // Si coincide exactamente con el snapshot actual, se queda
     if (currentLogsSet.has(key)) {
+      Logger.log("G[%s] KEEP (snapshot exact match by key)", (ROW_START + i));
       keptIndexados.push([text]);
       continue;
     }
 
-    const oldMeta = parseTaskMeta_(text);
+    // ✅ FIX: si programTime NO es del mismo día que hoy, se borra de G.
+    // Y si además existe en snapshot, empuja la versión actual a M.
+    //
+    // IMPORTANTE:
+    // - Si NO podemos parsear programTime (programDayKey vacío), también se elimina de G
+    //   (esto evita “atascos” cuando Date(v) falla y nunca se cumple la condición).
+    const programDayUnknown = !hasProgramDay; // no parseable / missing
+
+    Logger.log(
+      "G[%s] programTime check: hasProgramDay=%s programDayUnknown=%s programDayIsNotToday=%s",
+      (ROW_START + i),
+      String(hasProgramDay),
+      String(programDayUnknown),
+      String(programDayIsNotToday)
+    );
+
+    if (programDayUnknown || programDayIsNotToday) {
+      Logger.log("G[%s] DELETE from G due to programTime day mismatch/unknown", (ROW_START + i));
+
+      if (oldMeta.concepto && currentByConcepto.has(oldMeta.concepto)) {
+        const cur = currentByConcepto.get(oldMeta.concepto);
+        Logger.log("G[%s] -> MOVE to M (snapshot current) concepto='%s'", (ROW_START + i), oldMeta.concepto);
+        movedToNoIndexados.push([cur.logText]);
+      } else {
+        Logger.log("G[%s] -> NO MOVE to M (concepto not found in snapshot) concepto='%s'", (ROW_START + i), (oldMeta.concepto || ""));
+      }
+
+      continue; // NO se añade a keptIndexados => se elimina de G
+    }
+
+    // Si tenemos el mismo concepto en snapshot, aplicamos reconcile por cambios
     if (oldMeta.concepto && currentByConcepto.has(oldMeta.concepto)) {
       const cur = currentByConcepto.get(oldMeta.concepto);
 
-      // ✅ NUEVO: solo nos importa el DÍA de programTime (no la hora)
-      // Borramos de G si programDayKey es un día anterior al de ejecución (todayKey).
-      const hasProgramDay = !!oldMeta.programDayKey;
-      const programDayIsEarlierThanToday = hasProgramDay && (oldMeta.programDayKey < todayKey);
+      const changed = taskMetaChanged_(oldMeta, cur.meta);
+      Logger.log(
+        "G[%s] reconcile concepto='%s': changed=%s",
+        (ROW_START + i),
+        oldMeta.concepto,
+        String(changed)
+      );
 
-      // Caso 1: cambian campos “reales” (deadline/prio/prep/eta/progreso)
-      if (taskMetaChanged_(oldMeta, cur.meta)) {
-        if (programDayIsEarlierThanToday) {
-          movedToNoIndexados.push([cur.logText]);
-          continue; // se elimina de indexados
-        }
-        // Si no es anterior, se queda
-        keptIndexados.push([text]);
-        continue;
-      }
-
-      // Caso 2: NO cambian campos reales, pero programTime está en un día anterior → expulsa igual
-      if (programDayIsEarlierThanToday) {
+      // Si mismo Concepto pero cambian campos “reales”, se borra de G y se empuja la versión actualizada a M
+      if (changed) {
+        Logger.log("G[%s] DELETE from G due to meta change; MOVE updated to M concepto='%s'", (ROW_START + i), oldMeta.concepto);
         movedToNoIndexados.push([cur.logText]);
         continue; // se elimina de indexados
       }
 
-
+      // Si no cambió y es de HOY, se mantiene
+      Logger.log("G[%s] KEEP (same-day programTime + no meta change) concepto='%s'", (ROW_START + i), oldMeta.concepto);
       keptIndexados.push([text]);
+      continue;
     }
+
+    // Si no está en snapshot (ya no existe), se elimina (no se conserva)
+    Logger.log("G[%s] DELETE from G (not in snapshot by key and concepto not found)", (ROW_START + i));
   }
 
+  // Esto SIEMPRE se ejecuta antes de cualquier return temprano posterior
+  Logger.log("processTasksToDatabase_: compacting G; kept=%s movedToM=%s", keptIndexados.length, movedToNoIndexados.length);
   writeCompactedColumn_(checkRange, keptIndexados);
 
   const writeRange = db.getRange(ROW_START, writeColIndex, numRows, 1);
   writeRange.setWrap(false);
-  const writeVals = writeRange.getValues();
+  let writeVals = writeRange.getValues();
 
-  const keptWrite = [];
-  const removedWriteBecauseChanged = [];
+  // ✅ NEW: Pre-pase en M (your request)
+  // Si el concepto existe en el snapshot y programTime es de OTRO DÍA (horas irrelevantes),
+  // entonces NO borra ni compacta; actualiza "programTime:" en la MISMA celda a "now".
+  // (Se hace antes de dedupe/cleanup para que el resto de lógica opere con programTime actualizado.)
+  let touchedM = false;
 
   for (let i = 0; i < writeVals.length; i++) {
     const cell = writeVals[i][0];
     if (!cell) continue;
 
     const text = String(cell);
-    const key = normalizeLogKey_(text);
+    const meta = parseTaskMeta_(text);
+
+    const hasProgramDay_M = !!meta.programDayKey;
+    const conceptoIsInSnapshot_M = !!meta.concepto && currentByConcepto.has(meta.concepto);
+    const programDayIsNotToday_M = hasProgramDay_M && (meta.programDayKey !== todayKey);
+
+    if (conceptoIsInSnapshot_M && programDayIsNotToday_M) {
+      const updated = replaceOrSetProgramTimeLine_(text, now);
+      writeVals[i][0] = updated;
+      touchedM = true;
+
+      Logger.log(
+        "M[%s] UPDATE programTime (same concepto in snapshot, different day): concepto='%s' oldDay='%s' newDay='%s'",
+        (ROW_START + i),
+        meta.concepto,
+        meta.programDayKey,
+        todayKey
+      );
+    }
+  }
+
+  if (touchedM) {
+    writeRange.setValues(writeVals);
+    // Relee para que el resto de la función trabaje con el contenido ya persistido
+    writeVals = writeRange.getValues();
+  }
+
+  const keptWrite = [];
+  const removedWriteBecauseChanged = [];
+
+  // ✅ EXTRA: remove duplicates already present in M by stable key
+  const seenWrite = new Set();
+
+  for (let i = 0; i < writeVals.length; i++) {
+    const cell = writeVals[i][0];
+    if (!cell) continue;
+
+    const text = String(cell);
+    const key = taskDedupeKeyFromText_(text);
+
+    // elimina duplicados ya existentes en M
+    if (seenWrite.has(key)) {
+      Logger.log("M[%s] DROP duplicate by key", (ROW_START + i));
+      continue;
+    }
+    seenWrite.add(key);
 
     if (currentLogsSet.has(key)) {
       keptWrite.push([text]);
@@ -331,11 +467,13 @@ function processTasksToDatabase_(db, now) {
     if (oldMeta.concepto && currentByConcepto.has(oldMeta.concepto)) {
       const cur = currentByConcepto.get(oldMeta.concepto);
       if (taskMetaChanged_(oldMeta, cur.meta)) {
+        Logger.log("M[%s] REMOVE outdated; concepto='%s' -> will re-add updated", (ROW_START + i), oldMeta.concepto);
         removedWriteBecauseChanged.push([cur.logText]);
         continue;
       }
       keptWrite.push([text]);
     }
+    // Si no está en snapshot, se elimina (no se conserva)
   }
 
   writeCompactedColumn_(writeRange, keptWrite);
@@ -346,13 +484,13 @@ function processTasksToDatabase_(db, now) {
   if (writeOffset >= writeValsAfter.length) return;
 
   const alreadyLogged = new Set();
-  keptIndexados.forEach(r => alreadyLogged.add(normalizeLogKey_(r[0])));
-  keptWrite.forEach(r => alreadyLogged.add(normalizeLogKey_(r[0])));
+  keptIndexados.forEach(r => alreadyLogged.add(taskDedupeKeyFromText_(r[0])));
+  keptWrite.forEach(r => alreadyLogged.add(taskDedupeKeyFromText_(r[0])));
 
   const out = [];
 
   function pushIfNotLogged_(logText) {
-    const key = normalizeLogKey_(logText);
+    const key = taskDedupeKeyFromText_(logText);
     if (alreadyLogged.has(key)) return;
     if (writeOffset + out.length >= writeValsAfter.length) return;
     out.push([logText]);
@@ -364,7 +502,7 @@ function processTasksToDatabase_(db, now) {
 
   for (let i = 0; i < orderedLogs.length; i++) {
     const logText = orderedLogs[i];
-    const key = normalizeLogKey_(logText);
+    const key = taskDedupeKeyFromText_(logText);
 
     if (alreadyLogged.has(key)) continue;
     if (writeOffset + out.length >= writeValsAfter.length) break;
@@ -376,9 +514,13 @@ function processTasksToDatabase_(db, now) {
   if (out.length) {
     importWeekFromToday();
     db.getRange(ROW_START + writeOffset, writeColIndex, out.length, 1).setValues(out);
-  
   }
 }
+
+
+
+
+
 
 /**
  * Builds a snapshot of pending tasks using the same base logic as getPendingTasks_(now),
@@ -450,8 +592,8 @@ function buildTasksSnapshot_(now) {
       programTime: new Date(now.getTime())
     });
 
-    const key = normalizeLogKey_(logText);
     const meta = parseTaskMeta_(logText);
+    const key = taskDedupeKeyFromMeta_(meta);
 
     currentLogsSet.add(key);
     orderedLogs.push(logText);
@@ -576,10 +718,31 @@ function parseTaskMeta_(logText) {
       continue;
     }
 
-    // ✅ NUEVO
+    // ✅ NUEVO (robusto):
+    // Acepta:
+    //  - "programTime: 1766791323000" (epoch ms)
+    //  - "programTime: Sat Dec 26 2025 22:42:03 GMT+0100 (Central European Standard Time)"
     if (line.startsWith("programTime: ")) {
-      const v = line.substring(13).trim();
-      const d = new Date(v);
+      const vRaw = line.substring(13).trim();
+
+      // 1) intento numérico directo (epoch ms)
+      const asNum = Number(vRaw);
+      if (isFinite(asNum) && asNum > 0) {
+        res.programTimeMs = asNum;
+        const dNum = new Date(asNum);
+        if (!isNaN(dNum.getTime())) res.programDayKey = dateKeyFromDate_(dNum);
+        continue;
+      }
+
+      // 2) intento Date(vRaw) normal
+      let d = new Date(vRaw);
+
+      // 3) fallback: recorta lo de "(Central ...)" para que Date() lo trague mejor si falla
+      if (isNaN(d.getTime())) {
+        const vTrim = vRaw.replace(/\s*\(.*\)\s*$/, "").trim(); // quita "(...)"
+        d = new Date(vTrim);
+      }
+
       if (!isNaN(d.getTime())) {
         res.programTimeMs = d.getTime();
         res.programDayKey = dateKeyFromDate_(d);
@@ -590,6 +753,7 @@ function parseTaskMeta_(logText) {
 
   return res;
 }
+
 
 /**
  * Computes:
@@ -729,4 +893,40 @@ function normalizeLogKey_(t) {
     .replace(/\r\n/g, "\n")        // normalize line endings
     .replace(/[ \t]+$/gm, "")     // trim trailing spaces per line
     .trimEnd();                   // remove trailing newlines/spaces at end
+}
+
+/************ NEW: TASK DEDUPE KEYS ************/
+
+/**
+ * Key estable para dedupe de tareas (IGNORA programTime).
+ * Usa el meta parseado: concepto + deadlineMs + prio + prep + etaHours + progresoPct
+ * Si no hay concepto, fallback a FULL TEXT normalizado.
+ */
+function taskDedupeKeyFromText_(logText) {
+  const m = parseTaskMeta_(logText);
+
+  if (m.concepto) {
+    const dl = isFiniteNumber_(m.deadlineMs) ? m.deadlineMs : "NaN";
+    const pr = isFiniteNumber_(m.prio) ? m.prio : "NaN";
+    const et = isFiniteNumber_(m.etaHours) ? m.etaHours : "NaN";
+    const pg = isFiniteNumber_(m.progresoPct) ? m.progresoPct : "NaN";
+    const pp = String(m.prep || "");
+
+    return "TSK|" + m.concepto + "|" + dl + "|" + pr + "|" + pp + "|" + et + "|" + pg;
+  }
+
+  return "TSKTXT|" + normalizeLogKey_(logText);
+}
+
+/**
+ * Misma key pero a partir de la meta snapshot.
+ */
+function taskDedupeKeyFromMeta_(meta) {
+  if (!meta || !meta.concepto) return "TSKTXT|";
+  const dl = isFiniteNumber_(meta.deadlineMs) ? meta.deadlineMs : "NaN";
+  const pr = isFiniteNumber_(meta.prio) ? meta.prio : "NaN";
+  const et = isFiniteNumber_(meta.etaHours) ? meta.etaHours : "NaN";
+  const pg = isFiniteNumber_(meta.progresoPct) ? meta.progresoPct : "NaN";
+  const pp = String(meta.prep || "");
+  return "TSK|" + meta.concepto + "|" + dl + "|" + pr + "|" + pp + "|" + et + "|" + pg;
 }
