@@ -29,7 +29,7 @@ function logDailyTrackingToDatabase(sheetName = "MainDashboard", opts) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   /************ CONFIG ORIGEN ************/
-  const SOURCE_SHEET_NAME = sheetName;
+  const SOURCE_SHEET_NAME = "MainDashboard";
 
   const START_ROW = 4;
   const END_ROW = 49;
@@ -410,7 +410,7 @@ function logMedTimeInputsToDatabase(sheetName = "MainDashboard") {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   /************ CONFIG ORIGEN ************/
-  const SOURCE_SHEET_NAME = sheetName;
+  const SOURCE_SHEET_NAME = "MainDashboard";
 
   const START_ROW = 4;
   const END_ROW = 49;
