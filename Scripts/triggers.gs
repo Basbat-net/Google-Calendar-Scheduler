@@ -1,10 +1,10 @@
 
 function logTrackingTrigger() {
-  ScriptApp.newTrigger("logTrackingScheduler_")
+  ScriptApp.newTrigger("logDailyTrackingToDatabase")
     .timeBased()
     .everyDays(1)
     .atHour(23)
-    .nearMinute(45)
+    .nearMinute(40)
     .create();
 }
 
@@ -70,20 +70,14 @@ function debugListTriggers() {
 
 
 function onOpen() {
-  writeNext5UpcomingEventsToJ3N7()
+  writeNext5UpcomingEventsToJ3N7();
   SpreadsheetApp.getUi()
-    .createMenu("Calendar → Sheet")
-    .addItem("Importar semana (hoy)", "importWeekFromToday")
-    .addItem("Importar semana (fecha en B1)", "importWeekFromCellB1")
+    .createMenu('Funciones Manuales')
+    .addItem("Importar Calendar Sheet", "importWeekFromToday")
     .addToUi();
-    
-  SpreadsheetApp.getUi()
-    .createMenu('Dashboard')
-    .addItem('Recalculate widgets', 'forceRecalcMainDashboard_')
-    .addToUi();
-  Utilities.sleep(500);
-  renderMainDashboard_G4_values_();
 
+  Utilities.sleep(500);
+  updateEstudioWeekAndTotalSums();
 }
 
 
