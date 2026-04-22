@@ -21,10 +21,13 @@ function planSchedule() {
 
   const hasNewFixedLogs = (LAST_CALENDAR_WRITE_MOVED || 0) > 0;
   const hasNewTaskLogs  = (LAST_TASKS_WRITE_MOVED || 0) > 0;
+  // Check raw exam logs from database (column C), not the derived study array
+  const rawExamLogs = (LOGGED_CALENDAR_EVENTS && LOGGED_CALENDAR_EVENTS["Examenes"]) ? LOGGED_CALENDAR_EVENTS["Examenes"] : [];
+  const hasNoExams      = rawExamLogs.length === 0;
 
-  // CASE 1: New fixed event(s) were added (I/J/K/L)
+  // CASE 1: New fixed event(s) were added (I/J/K/L), new task logs (M), or no exams fetched
   // -> run full pipeline exactly as before
-  if (hasNewFixedLogs || hasNewTaskLogs) {
+  if (hasNewFixedLogs || hasNewTaskLogs || hasNoExams) {
     const eventTotal = [...tareasPendientes, ...examEvents, ...projectEvents];
 
     if (eventTotal.length > 0) {
@@ -50,7 +53,7 @@ function clearAllCalendars(){
   const now = getNow_(); // Momento (con offset)
   const end = getDynamicHorizonEnd_(now);
   clearAutomaticEvents_(fetchCalendar_("Estudio"), now, end);
-  clearAutomaticEvents_(fetchCalendar_("Proyecto"), now, end);
+  clearAutomaticEvents_(fetchCalendar_("Proyectos"), now, end);
   clearAutomaticEvents_(fetchCalendar_("Tareas"), now, end);
 
 }
