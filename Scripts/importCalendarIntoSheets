@@ -57,7 +57,7 @@ function importWeek_(anyDate) {
   const counters = {
     byType30m: {
       "Estudio": 0,
-      "Proyecto": 0,
+      "Proyectos": 0,
       "Tareas": 0
     },
     bySubject30m: {} // solo Estudio, por asignatura
@@ -90,6 +90,11 @@ function importWeek_(anyDate) {
   // cache de carril por (día + evento)
   const laneByDayEventKey = {};
 
+  // *** MAPA DE OCUPACIÓN EN MEMORIA: occupancy[dayKey][col][row] = true ***
+  // Necesario para detectar solapamientos ANTES de escribir en la hoja,
+  // ya que leer celdas durante la importación siempre devolvería vacío.
+  const occupancy = {};
+
   // Importación
   for (const cal of calendars) {
     const calName = cal.getName();
@@ -113,50 +118,79 @@ function importWeek_(anyDate) {
         ? ev.getId()
         : (calName + "||" + (ev.getTitle() || "") + "||" + s.getTime() + "||" + e.getTime());
 
+      // Recopilar todos los bloques de 30 min que ocupa este evento
+      const eventBlocks = [];
       let cur = new Date(s);
       while (cur < e) {
-        const dayKey = dayKeyFromDate_(cur);
+        const dayKey  = dayKeyFromDate_(cur);
         const baseCol = dayCols[dayKey];
-        const row = timeRows[hhmm_(cur)];
-
+        const row     = timeRows[hhmm_(cur)];
         if (baseCol && row) {
-          const laneKey = dayKey + "||" + evId;
+          eventBlocks.push({ dayKey, row, baseCol });
+        }
+        cur = new Date(cur.getTime() + 30 * 60 * 1000);
+      }
 
-          if (!laneByDayEventKey[laneKey]) {
-            const chosen = findPlacementCol_(sh, row, dayKey, baseCol, dayBounds);
-            laneByDayEventKey[laneKey] = chosen || baseCol;
-          }
+      if (eventBlocks.length === 0) continue;
 
-          const destCol = laneByDayEventKey[laneKey];
+      const { dayKey, baseCol } = eventBlocks[0];
+      const b = dayBounds[dayKey];
+      if (!b) continue;
 
-          // Seguridad: no invadir cabecera del siguiente día
-          const b = dayBounds[dayKey];
-          if (b && destCol <= b.rightLimit) {
-            // CONTAR BLOQUES (30 min) de Estudio/Proyecto/Tareas
-            if (calName === "Estudio" || calName === "Proyecto" || calName === "Tareas") {
-              counters.byType30m[calName] = (counters.byType30m[calName] || 0) + 1;
+      const laneKey = dayKey + "||" + evId;
 
-              // CONTAR por asignatura (solo Estudio) si coincide con la lista
-              if (calName === "Estudio") {
-                const concept = title;
-                if (concept && Object.prototype.hasOwnProperty.call(counters.bySubject30m, concept)) {
-                  counters.bySubject30m[concept] += 1;
-                }
-              }
-            }
+      if (!laneByDayEventKey[laneKey]) {
+        if (!occupancy[dayKey]) occupancy[dayKey] = {};
 
-            const cell = sh.getRange(row, destCol);
-            const prev = String(cell.getValue() || "").trim();
+        // Comprobar si algún bloque del evento colisiona en la columna base
+        const baseOcc   = occupancy[dayKey][baseCol] || {};
+        const hasConflict = eventBlocks.some(({ row }) => !!baseOcc[row]);
 
-            if (!prev) {
-              cell.setValue(label);
-            } else if (!prev.split("\n").includes(label)) {
-              cell.setValue(prev + "\n" + label);
+        // Si hay conflicto, ir directamente a la columna de la derecha;
+        // si no, quedarse en la base.
+        let chosenCol = baseCol;
+        if (hasConflict) {
+          const rightCol = baseCol + 1;
+          chosenCol = (rightCol <= b.rightLimit) ? rightCol : baseCol;
+        }
+
+        laneByDayEventKey[laneKey] = chosenCol;
+
+        // Marcar ocupación en memoria
+        if (!occupancy[dayKey][chosenCol]) occupancy[dayKey][chosenCol] = {};
+        for (const { row } of eventBlocks) {
+          occupancy[dayKey][chosenCol][row] = true;
+        }
+      }
+
+      const destCol = laneByDayEventKey[laneKey];
+
+      // Escribir bloques en la hoja + actualizar contadores
+      for (const { row } of eventBlocks) {
+        const bk = dayBounds[dayKeyFromDate_(new Date(s))]; // mismo day
+        if (!bk || destCol > bk.rightLimit) continue;
+
+        // CONTAR BLOQUES (30 min) de Estudio/Proyecto/Tareas
+        if (calName === "Estudio" || calName === "Proyectos" || calName === "Tareas") {
+          counters.byType30m[calName] = (counters.byType30m[calName] || 0) + 1;
+
+          // CONTAR por asignatura (solo Estudio) si coincide con la lista
+          if (calName === "Estudio") {
+            const concept = title;
+            if (concept && Object.prototype.hasOwnProperty.call(counters.bySubject30m, concept)) {
+              counters.bySubject30m[concept] += 1;
             }
           }
         }
 
-        cur = new Date(cur.getTime() + 30 * 60 * 1000);
+        const cell = sh.getRange(row, destCol);
+        const prev = String(cell.getValue() || "").trim();
+
+        if (!prev) {
+          cell.setValue(label);
+        } else if (!prev.split("\n").includes(label)) {
+          cell.setValue(prev + "\n" + label);
+        }
       }
     }
   }
@@ -167,7 +201,6 @@ function importWeek_(anyDate) {
   // NUEVO: salida a MainDashboard en HORAS
   writeWeeklyCountsToMainDashboard_(ss, counters, rawOrdered);
 }
-
 /************ HELPERS ************/
 function writeWeeklyCountsToMainDashboard_(ss, counters, rawOrderedSubjects) {
   const shOut = ss.getSheetByName("MainDashboard");
@@ -177,7 +210,7 @@ function writeWeeklyCountsToMainDashboard_(ss, counters, rawOrderedSubjects) {
 
   // Totales por tipo
   shOut.getRange(CFG2.outEstudioA1).setValue(toHours(counters.byType30m["Estudio"] || 0));
-  shOut.getRange(CFG2.outProyectoA1).setValue(toHours(counters.byType30m["Proyecto"] || 0));
+  shOut.getRange(CFG2.outProyectoA1).setValue(toHours(counters.byType30m["Proyectos"] || 0));
   shOut.getRange(CFG2.outTareasA1).setValue(toHours(counters.byType30m["Tareas"] || 0));
 
   // Asignaturas: M11:M18 mapeado por índice con database!J5:J12 (mismo orden)
