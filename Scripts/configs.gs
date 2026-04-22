@@ -20,10 +20,13 @@ const INTERVALOS_USABLES_FINDES =
 
 //Calendarios estáticos para planificar entorno a ellos
 // están con numero porque algunos calendarios les he querido meter padding (offset x delante y detrás)
-const FIXED_CALENDARS = {"Clases":0,"General":1,"Laboratorio":0,"Laboratorios":0,"Examenes":1}
-// IMPORTANTE: Los nombres de los examenes deben ser iguales a los de este array, si no se te va a rallar
-const SUBJECTS = [
-  "circuitos", "ciencia", "regu", "resis", "termo","analogica","tmm"];
+const FIXED_CALENDARS = {"Clases":0,"General":1,"Laboratorios":0,"Examenes":1}
+// IMPORTANTE: Los nombres de los examenes deben ser iguales a los de este rango, si no se te va a rallar
+const SUBJECTS = SpreadsheetApp.getActiveSpreadsheet()
+  .getRange('database!J5:J12')
+  .getValues()
+  .flat()
+  .filter(v => v !== "");
 
 
 const BASE_STUDY_HOURS = [0,3,5,8,10,15]; // el indice n es el numero de horas para las cosas de prioridad n (prio 1->3h en el ejemplo)
@@ -41,4 +44,4 @@ const NOW_OFFSET_HOURS = 3; // hay un bug ahora de que empieza en la media hora 
                                // en -0.5 para corregirlo, pero en teoría debería ser 0
 
 const calendarByType = {};
-const now = getNow_(); 
+const now = getNow_();
