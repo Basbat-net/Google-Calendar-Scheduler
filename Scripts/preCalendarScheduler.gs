@@ -574,7 +574,7 @@ function getPendingTasks_(now) {
     const parsed = parseTaskFromLog_(LOGGED_TASKS[i]);
     if (!parsed) continue;
 
-    const { concepto, rowIndex, deadline, prio: prioIn, etaHours, progreso } = parsed;
+    let { concepto, rowIndex, deadline, prio: prioIn, etaHours, progreso } = parsed;
 
     const rawMinutes = etaHours * 60 * (1 - progreso);
     if (rawMinutes <= 0) continue; // para que ignore las que están completas (progreso >= 100)
@@ -586,7 +586,13 @@ function getPendingTasks_(now) {
 
     let prio = prioIn;
     const isOverdue = (deadline !== null && deadline.getTime() < now.getTime()); // booleano de si ya ha pasado la fecha
-    if (isOverdue) prio = 5;
+    if (isOverdue) {
+      prio = 5;
+      // Treat overdue tasks as due tomorrow at 23:59 so the tower scheduler can place them
+      const tomorrow = addDays_(startOfDay_(now), 1);
+      tomorrow.setHours(23, 59, 0, 0);
+      deadline = tomorrow;
+    }
 
     // start = ahora
     const start = now;
@@ -682,7 +688,7 @@ function buildProjectPriorityArray_(now, horizon) {
         result.push({
           bracket: 1,
           concepto: projectName,
-          type: "Proyecto",
+          type: "Proyectos",
           etaMinutesRemaining: minutes,
           id: "P#" + (seq++),
           isOverdue: false,
@@ -1293,7 +1299,7 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
 
             // Para probar movimientos, como Estudio tiene una duración minima de 1h, puede que en target no haya de ese
             // evento y no se pueda mover solo media hora, asi que permitimos los dos movimientos
-            const stepOptions = (type === "Estudio" || type === "Proyecto" ) ? [1, 2] : [1];
+            const stepOptions = (type === "Estudio" || type === "Proyectos" ) ? [1, 2] : [1];
 
             // Probamos a encontrar un movimiento para ese evento que mejore la situación
             for (let s = 0; s < stepOptions.length; s++) {
@@ -1305,7 +1311,7 @@ function optimizeScheduleWithTowers_(freeSlots, eventsByBracket) {
               const newTargetCount = blocksOnTarget + stepBlocks;
 
 
-              if (type === "Estudio" || type === "Proyecto" )  {
+              if (type === "Estudio" || type === "Proyectos" )  {
                 // esta arrow function dice si el movimiento es valido en base a si en ambos se queda un conteo valido de intervalos de media hora
                 const validEstudio = c => c === 0 || (c >= 2 && c <= 6); 
                 if (!validEstudio(newSourceCount) || !validEstudio(newTargetCount)) continue;
@@ -1742,7 +1748,10 @@ function getDynamicHorizonEnd_(now) {
     Logger.log("getDynamicHorizonEnd_: fallo leyendo tareas: " + e);
   }
 
+
   // --- 2) Último EXAMEN (calendario) ---
+  // Se rastrean por separado: si no hay examenes, el horizonte se limita a 7 días
+  const examCandidates = [];
   try {
     const calEx = fetchCalendar_(EXAM_CALENDAR_NAME);
     const start = startOfDay_(now);
@@ -1750,15 +1759,23 @@ function getDynamicHorizonEnd_(now) {
     const evs = calEx.getEvents(start, end);
     evs.forEach(ev => {
       const s = ev.getStartTime();
-      if (s && s instanceof Date && !isNaN(s.getTime())) candidates.push(s);
+      if (s && s instanceof Date && !isNaN(s.getTime())) examCandidates.push(s);
     });
   } catch (e) {
     Logger.log("getDynamicHorizonEnd_: fallo leyendo examenes: " + e);
   }
 
+  // Si no hay examenes, limitamos el horizonte a 7 días desde hoy independientemente del resto
+  if (examCandidates.length === 0) {
+    Logger.log("getDynamicHorizonEnd_: sin examenes -> horizonte fijo de 7 días.");
+    return addDays_(startOfDay_(now), 7);
+  }
+
+  candidates.push(...examCandidates);
+
   // --- 3) Último LABORATORIO (calendarios fijos) ---
   // Por tu config, puede existir "Laboratorio" y/o "Laboratorios"
-  ["Laboratorio", "Laboratorios"].forEach(name => {
+  ["Laboratorios"].forEach(name => {
     try {
       const calLab = fetchCalendar_(name);
       const start = startOfDay_(now);
@@ -1773,12 +1790,12 @@ function getDynamicHorizonEnd_(now) {
     }
   });
 
-  // Si no hay nada, fallback a comportamiento actual
+  // Si no hay nada (no debería llegar aquí sin examenes), fallback a 7 días
   if (candidates.length === 0) {
-    return new Date(now.getTime() + HORIZON_DAYS * 24 * 60 * 60 * 1000);
+    return addDays_(startOfDay_(now), 7);
   }
 
-  // Cogemos el más tardío y le damos un pequeño margen para que el planning lo “incluya bien”
+  // Cogemos el más tardío y le damos un pequeño margen para que el planning lo "incluya bien"
   let maxD = candidates[0];
   for (let i = 1; i < candidates.length; i++) {
     if (candidates[i].getTime() > maxD.getTime()) maxD = candidates[i];
