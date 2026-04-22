@@ -118,7 +118,7 @@ const START_ROW = 1497;
 const COL_BY_CALNAME = {
   "Tareas": "N",
   "Estudio": "O",
-  "Proyecto": "P"
+  "Proyectos": "P"
 };
 
 const db = SpreadsheetApp.getActive().getSheetByName(DB_SHEET_NAME);
@@ -384,6 +384,7 @@ function renderMainDashboard_G4_values() {
     } else {
       try {
         const endRow = getMergeEnd("Calendario", col, r);
+        Logger.log("end row:" + endRow + " col: " + col + " row: " + r)
         const idx = endRow; // 1-based -> 0-based
         value = calA[idx]?.[0] ?? "";
       } catch (e) {
@@ -433,7 +434,7 @@ function renderMainDashboard_G4_values() {
  */
 function updateEstudioWeekAndTotalSums() {
   const ss = SpreadsheetApp.getActive();
-  const sh = ss.getActiveSheet();
+  const sh = ss.getSheetByName("MainDashboard");
   const db = ss.getSheetByName("database");
   if (!db) throw new Error("No existe la hoja 'database'.");
 
@@ -526,7 +527,7 @@ function updateEstudioWeekAndTotalSums() {
 
     let intervals = 0;
 
-    if (done && (tipo === "Estudio" || tipo === "Proyecto" || tipo === "Tareas")) {
+    if (done && (tipo === "Estudio" || tipo === "Proyectos" || tipo === "Tareas")) {
       intervals = intervals30mBetween_(ini, fin);
 
       if (tipo === "Estudio") {
@@ -536,7 +537,7 @@ function updateEstudioWeekAndTotalSums() {
           if (dashEstudioBySubjectIntervals[concepto] == null) dashEstudioBySubjectIntervals[concepto] = 0;
           dashEstudioBySubjectIntervals[concepto] += intervals;
         }
-      } else if (tipo === "Proyecto") {
+      } else if (tipo === "Proyectos") {
         dashProyectoIntervals += intervals;
       } else if (tipo === "Tareas") {
         dashTareasIntervals += intervals;
@@ -677,7 +678,7 @@ function updateEstudioWeekAndTotalSums() {
 
     const inThisWeek = (fecha instanceof Date && fecha >= minDate && fecha <= now);
 
-    if (tipo === "Proyecto") {
+    if (tipo === "Proyectos") {
       totalProyectoAll_all_DB += duracion;
       if (inThisWeek) totalProyectoWeek_all_DB += duracion;
     } else if (tipo === "Tareas") {
@@ -751,4 +752,3 @@ function updateEstudioWeekAndTotalSums() {
     );
   }
 }
-
